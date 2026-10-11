@@ -29,15 +29,22 @@ Get the model files (about 350 MB) into a folder:
     curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
     curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 
-Build and start it, published on this machine's Tailscale address only:
+Build and start it, listening on this machine's Tailscale address only.
+It uses the host's network, so a host firewall such as ufw sees it as an
+ordinary port (Docker's published ports go around ufw's input rules):
 
     docker build -t mutara-voiceserver tools/voiceserver
     docker run -d --name mutara-voiceserver --restart unless-stopped \
-      -p "$(tailscale ip -4):7374:7374" \
+      --network host \
       -v "$PWD/models:/models:ro" -v mutara-voice-cache:/cache \
-      mutara-voiceserver
+      mutara-voiceserver python server.py --listen "$(tailscale ip -4):7374" \
+        --models /models --cache /cache
 
-For a node on the same machine, use `-p 127.0.0.1:7374:7374` instead.
+With ufw, let Tailscale reach it:
+
+    sudo ufw allow in on tailscale0 to any port 7374 proto tcp
+
+For a node on the same machine, use `--listen 127.0.0.1:7374` instead.
 
 ## Run without Docker
 
