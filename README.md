@@ -62,14 +62,14 @@ as `http://100.64.0.5:7374`, and pick the voice. Or in the settings file:
 voice_server:
   url: http://100.64.0.5:7374
   voice: af_sarah   # the default
-  speed: 0.9        # the default
+  speed: 0.8        # the default
   timeout: 5s       # the default
 ```
 
 ## API
 
     GET  /v1/voices   {"voices": ["af_alloy", ...], "default": "af_sarah"}
-    POST /v1/speech   {"text": "...", "voice": "af_sarah", "speed": 0.9}
+    POST /v1/speech   {"text": "...", "voice": "af_sarah", "speed": 0.8}
                       -> audio/wav, 24 kHz mono 16-bit, speech at -20 dBFS RMS
     GET  /healthz     ok
 

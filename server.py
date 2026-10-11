@@ -5,7 +5,7 @@ plays the WAV that comes back; it keeps its own copy, and uses the built-in
 Allison clips when the server does not answer in time. See README.md.
 
     GET  /v1/voices   {"voices": ["af_sarah", ...], "default": "af_sarah"}
-    POST /v1/speech   {"text": "...", "voice": "af_sarah", "speed": 0.9}
+    POST /v1/speech   {"text": "...", "voice": "af_sarah", "speed": 0.8}
                       -> audio/wav, 24 kHz mono 16-bit, speech at -20 dBFS
     GET  /healthz     ok
 
@@ -184,7 +184,7 @@ def handler(sp, log):
                 req = json.loads(self.rfile.read(n))
                 text = str(req.get("text", "")).strip()
                 voice = str(req.get("voice") or DEFAULT_VOICE)
-                speed = round(float(req.get("speed") or 0.9), 2)
+                speed = round(float(req.get("speed") or 0.8), 2)
                 if not text or len(text) > MAX_TEXT:
                     raise ValueError(f"text must be 1 to {MAX_TEXT} characters")
                 if voice not in sp.voices:
