@@ -64,7 +64,13 @@ voice_server:
   voice: af_sarah   # the default
   speed: 0.8        # the default
   timeout: 5s       # the default
+  # The voice ID as a sentence (node.id_mode voice or both). It must
+  # contain the callsign. Write node numbers as single digits.
+  id_text: "This is N0CALL, Mutara node 1 9 9 9"
 ```
+
+The node makes each phrase once and keeps a copy, so the first ID after a
+change is spelled by Allison while the server makes the new one.
 
 ## API
 
