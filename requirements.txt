@@ -1,0 +1,2 @@
+kokoro-onnx==0.6.1
+numpy==2.5.3
