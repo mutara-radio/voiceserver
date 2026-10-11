@@ -15,6 +15,11 @@ does not answer within `voice_server.timeout` (5 s), the node uses its
 built-in Allison voice. The voice ID never waits: the node makes it ready
 at start and uses Allison until it is.
 
+Weather alerts need this server: Allison has a fixed list of words and
+can't read an alert. An alert waits up to 30 s for the server; if the
+server does not answer, the alert is not spoken and the dashboard's event
+log says so.
+
 ## Security
 
 The server has no password. Run it where only your nodes can reach it: on
