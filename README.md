@@ -22,11 +22,11 @@ log says so.
 
 ## What it needs
 
-Not a Raspberry Pi. The installer refuses a Raspberry Pi, other small ARM
-boards and a host below these minimums, and it has no option to skip them:
+Not a Raspberry Pi. The installer refuses a Raspberry Pi, ARM computers
+and a host below these minimums, and it has no option to skip them:
 
-- Linux on x86-64 (tested). A 64-bit ARM server without a device tree is
-  accepted but not tested.
+- Linux on x86-64. Other CPU types, ARM servers too, are refused until
+  we test them.
 - 4 or more cores and 4 GB or more memory. AVX2 is not needed: on an
   8-core virtual machine without AVX, 3 s of speech takes about 2 s.
 - Docker Engine, and about 1.5 GB of disk: the image (about 420 MB), the

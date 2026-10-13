@@ -98,14 +98,7 @@ check_host() {
   arch=$(uname -m)
   case "$arch" in
     x86_64) ok "CPU type $arch" ;;
-    aarch64|arm64)
-      # A 64-bit ARM board (it has a device tree) is too slow; an ARM
-      # server is not.
-      [ -z "$model" ] || die "this is a $model ($arch). Small ARM boards are too slow for the voice server. Install it on a PC or server."
-      ok "CPU type $arch"
-      note "the voice server is tested on x86-64 Linux; this CPU type is not tested"
-      ;;
-    *) die "the CPU type $arch is not supported. The voice server needs a 64-bit PC or server (x86-64)." ;;
+    *) die "the CPU type $arch is not supported. The voice server is tested only on x86-64. Install it on a 64-bit PC or server." ;;
   esac
   local cores mem_kb
   cores=$(nproc)
