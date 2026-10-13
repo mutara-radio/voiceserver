@@ -1,2 +1,16 @@
+# Every package is pinned, the dependencies too, so that each build is the
+# same. Each version was at least two weeks old when it was pinned
+# (2026-10-13). Change them together, and test a synthesis after.
 kokoro-onnx==0.6.1
 numpy==2.5.3
+onnxruntime==1.30.0
+espeakng-loader==0.2.4
+phonemizer==3.4.0
+attrs==26.1.0
+dlinfo==2.0.0
+joblib==1.6.0
+cloudpickle==3.1.2
+typing_extensions==4.16.0
+flatbuffers==25.12.19
+packaging==26.3
+protobuf==7.36.2

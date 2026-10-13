@@ -7,8 +7,8 @@ that is too large for a Raspberry Pi (about 350 MB of model files and up to
 (`af_sarah`); any American (`af_*`, `am_*`) or British (`bf_*`, `bm_*`)
 Kokoro voice works.
 
-The node sends each announcement as text, such as "Node 5, 5, 0, 4, 6, 0,
-connected to node 5, 9, 4, 9, 5, 0.", and plays the speech that comes back.
+The node sends each announcement as text, such as "Node 2, 1, 0, 0,
+connected to node 2, 2, 0, 0.", and plays the speech that comes back.
 The server and the node both keep a copy, so a phrase is made only once;
 the node's copies are in `/var/lib/mutara/voice-cache`. When the server
 does not answer within `voice_server.timeout` (5 s), the node uses its
@@ -20,36 +20,53 @@ can't read an alert. An alert waits up to 30 s for the server; if the
 server does not answer, the alert is not spoken and the dashboard's event
 log says so.
 
+## What it needs
+
+Not a Raspberry Pi. The installer refuses a Raspberry Pi, other small ARM
+boards and a host below these minimums, and it has no option to skip them:
+
+- Linux on x86-64 (tested). A 64-bit ARM server without a device tree is
+  accepted but not tested.
+- 4 or more cores and 4 GB or more memory. AVX2 is not needed: on an
+  8-core virtual machine without AVX, 3 s of speech takes about 2 s.
+- Docker Engine, and about 1.5 GB of disk: the image (about 420 MB), the
+  model (about 350 MB) and the cache (up to `--cache-mb`, 500 MB).
+
 ## Security
 
 The server has no password. Run it where only your nodes can reach it: on
-the node's own machine (`127.0.0.1`) or on your Tailscale network. Do not
-publish it on a public address or forward a port to it.
+the node's own machine (`127.0.0.1`) or on your Tailscale or home network.
+The installer refuses `0.0.0.0` and public addresses. Do not forward a
+router port to it. Securing the host is the admin's job.
 
-## Run with Docker
-
-Get the model files (about 350 MB) into a folder:
-
-    mkdir models && cd models
-    curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
-    curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
-
-Build and start it, listening on this machine's Tailscale address only.
-It uses the host's network, so a host firewall such as ufw sees it as an
-ordinary port (Docker's published ports go around ufw's input rules):
-
-    docker build -t mutara-voiceserver tools/voiceserver
-    docker run -d --name mutara-voiceserver --restart unless-stopped \
-      --network host \
-      -v "$PWD/models:/models:ro" -v mutara-voice-cache:/cache \
-      mutara-voiceserver python server.py --listen "$(tailscale ip -4):7374" \
-        --models /models --cache /cache
-
-With ufw, let Tailscale reach it:
+The container uses the host's network, so a host firewall such as ufw sees
+it as an ordinary port (Docker's published ports go around ufw's input
+rules). With ufw, let only Tailscale reach it:
 
     sudo ufw allow in on tailscale0 to any port 7374 proto tcp
 
-For a node on the same machine, use `--listen 127.0.0.1:7374` instead.
+## Install with Docker
+
+The model is a separate download; this folder and the image do not contain
+it. Get `kokoro-v1.0.onnx` and `voices-v1.0.bin` from the release
+`model-files-v1.0` of [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx)
+and put them in one folder.
+
+Check the host, Docker, the model files (SHA-256) and the address. This
+changes nothing:
+
+    ./install.sh --check --models ~/mutara-voice/models --listen 100.64.0.5:7374
+
+Then install: the same command without `--check`. The script builds the
+image here, starts the container `mutara-voiceserver` with
+`--restart unless-stopped`, host networking, the models read-only and the
+cache in the volume `mutara-voice-cache`. It waits for the server, makes a
+test sentence, and prints the address to set on the node. `--listen`
+defaults to `127.0.0.1:7374`, for a node on the same machine.
+
+To install a new version, run it again with `--replace`; the cache stays.
+`./install.sh --help` lists the other options (container, image and volume
+names, cache size).
 
 ## Run without Docker
 
@@ -60,7 +77,7 @@ Needs Python 3.12 (espeak-ng from Homebrew on macOS):
 
 ## Set up the node
 
-In Settings → Station, set **Voice server** to the server's address, such
+In Settings → Announcements, set **Voice server** to the server's address, such
 as `http://100.64.0.5:7374`, and pick the voice. Or in the settings file:
 
 ```yaml
@@ -71,7 +88,7 @@ voice_server:
   timeout: 5s       # the default
   # The voice ID as a sentence (node.id_mode voice or both). It must
   # contain the callsign. Write node numbers as single digits.
-  id_text: "This is N0CALL, Mutara node 1 9 9 9"
+  id_text: "This is N0CALL, Mutara node 2 1 0 0"
 ```
 
 The node makes each phrase once and keeps a copy, so the first ID after a
@@ -82,7 +99,23 @@ change is spelled by Allison while the server makes the new one.
     GET  /v1/voices   {"voices": ["af_alloy", ...], "default": "af_sarah"}
     POST /v1/speech   {"text": "...", "voice": "af_sarah", "speed": 0.8}
                       -> audio/wav, 24 kHz mono 16-bit, speech at -20 dBFS RMS
+    GET  /health      {"status": "ok", "version": "1.1.0", "model": ..., "voices": 28, "uptime_s": ...}
+    GET  /stats       counters: requests, errors, in flight, waiting, last error,
+                      speech time (last, avg, p50, p95, max of the last 200),
+                      cache hits, misses, entries and bytes
     GET  /healthz     ok
+
+A speech answer has `X-Cache: hit` or `miss`. The Docker health check runs
+`python server.py --check`, which asks `/health`.
 
 Text is up to 400 characters. One phrase is made at a time; made speech is
 kept in the cache folder, up to `--cache-mb` (500 MB), oldest out first.
+
+## On the dashboard
+
+Settings → Health → Voice server (admins only) shows the node's side: the
+requests, the round trip (last, average, 95%), timeouts and errors, the
+node's copies, how often Allison spoke instead, the alerts not spoken and
+the last error. Below it is the server's `/stats`, which the node asks at
+most every 5 s. **Test voice** makes a test sentence and plays it in the
+browser, not on the air.
