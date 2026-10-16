@@ -16,9 +16,9 @@ Request body, JSON:
 
 | Field   | Type   | Note                                              |
 |---------|--------|---------------------------------------------------|
-| `text`  | string | Up to 400 characters. Must not be empty.          |
+| `text`  | string | 1 to 400 characters after trimming spaces.        |
 | `voice` | string | A Kokoro voice, such as `af_sarah`. Empty: the default. |
-| `speed` | number | 0.5 to 2.0. 0 or missing: 1.0.                    |
+| `speed` | number | 0.5 to 2.0, rounded to 2 decimals. 0 or missing: 0.8. |
 
 Request header, optional:
 
@@ -33,15 +33,15 @@ Answers:
 - `200`, `audio/wav`: 24 kHz, mono, 16-bit, speech at -20 dBFS RMS.
   Header `X-Cache: hit` or `miss`.
 - `400`: the request is not correct (no text, text too long, unknown
-  voice, speed out of range).
+  voice, speed out of range, a body over 4096 bytes).
 - `503` with `Retry-After` (seconds): the `later` queue is full. Only a
   `later` request gets this answer. The node waits for that time, then
   tries again.
 - `500`: the synthesis failed.
 
 The same text, voice and speed always give the same answer. Both sides
-keep a cache. The server's cache key is SHA-256 of the model name, the
-voice, the speed and the text. This key does not change between
+keep a cache. The server's cache key is the SHA-256 of
+`"{model}\n{voice}\n{speed:.2f}\n{text}"`. This key does not change between
 versions, so a cache stays valid after an upgrade.
 
 ## GET /v1/voices
