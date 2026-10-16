@@ -7,6 +7,11 @@ that is too large for a Raspberry Pi (about 350 MB of model files and up to
 (`af_sarah`); any American (`af_*`, `am_*`) or British (`bf_*`, `bm_*`)
 Kokoro voice works.
 
+This was the `tools/voiceserver` folder of Mutara until version 1.2.0.
+The history came with it. The HTTP contract with the node is in
+[API.md](API.md). The decision for the priority queue is ADR 0009 in
+the Mutara repo (`docs/adr/0009-voice-priority.md`).
+
 The node sends each announcement as text, such as "Node 2, 1, 0, 0,
 connected to node 2, 2, 0, 0.", and plays the speech that comes back.
 The server and the node both keep a copy, so a phrase is made only once;
@@ -96,6 +101,8 @@ change is spelled by Allison while the server makes the new one.
 
 ## API
 
+The full contract is in [API.md](API.md).
+
     GET  /v1/voices   {"voices": ["af_alloy", ...], "default": "af_sarah"}
     POST /v1/speech   {"text": "...", "voice": "af_sarah", "speed": 0.8}
                       header X-Voice-Priority: now or later (optional)
@@ -170,7 +177,7 @@ defaults.
 The tests use a fake voice in place of Kokoro. They need Python 3 and
 numpy, not the model files:
 
-    python3 tools/voiceserver/test_server.py
+    python3 test_server.py
 
 ## On the dashboard
 

@@ -1,7 +1,7 @@
 """Tests for the voice server queue (ADR 0009). They use a fake synth, so
 they need numpy only, not Kokoro or the model files:
 
-    python3 -I tools/voiceserver/test_server.py
+    python3 -I test_server.py
 """
 
 import hashlib
