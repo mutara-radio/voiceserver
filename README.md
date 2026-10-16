@@ -187,3 +187,14 @@ node's copies, how often Allison spoke instead, the alerts not spoken and
 the last error. Below it is the server's `/stats`, which the node asks at
 most every 5 s. **Test voice** makes a test sentence and plays it in the
 browser, not on the air.
+
+## License and third-party components
+
+The project source is licensed under **GPL-3.0-or-later**: GNU General
+Public License version 3, or (at your option) any later version. See
+[LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md).
+
+The authoritative repository is https://github.com/mutara-radio/voiceserver.
+This repository distributes source only, not container images, compiled
+binaries, dependency packages, model weights or voice files. Users build
+and obtain dependencies and models separately under their respective terms.
