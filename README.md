@@ -98,18 +98,79 @@ change is spelled by Allison while the server makes the new one.
 
     GET  /v1/voices   {"voices": ["af_alloy", ...], "default": "af_sarah"}
     POST /v1/speech   {"text": "...", "voice": "af_sarah", "speed": 0.8}
+                      header X-Voice-Priority: now or later (optional)
                       -> audio/wav, 24 kHz mono 16-bit, speech at -20 dBFS RMS
-    GET  /health      {"status": "ok", "version": "1.1.0", "model": ..., "voices": 28, "uptime_s": ...}
+                      -> 503 and Retry-After when the later queue is full
+    GET  /health      {"status": "ok", "version": "1.2.0", "model": ..., "voices": 28, "uptime_s": ...,
+                       "workers": 1, "queue": {"now": 0, "later": 3},
+                       "wait_ms": {"now": 120, "later": 4100}, "busy_503": 0}
     GET  /stats       counters: requests, errors, in flight, waiting, last error,
                       speech time (last, avg, p50, p95, max of the last 200),
-                      cache hits, misses, entries and bytes
+                      cache hits, misses, entries and bytes, and the queue
+                      fields of /health
     GET  /healthz     ok
 
 A speech answer has `X-Cache: hit` or `miss`. The Docker health check runs
 `python server.py --check`, which asks `/health`.
 
-Text is up to 400 characters. One phrase is made at a time; made speech is
-kept in the cache folder, up to `--cache-mb` (500 MB), oldest out first.
+Text is up to 400 characters. Made speech is kept in the cache folder, up
+to `--cache-mb` (500 MB), oldest out first. The cache keeps the full text
+as one answer.
+
+## Priority
+
+A request has a priority in the header `X-Voice-Priority`:
+
+- `now`: a listener waits for it. A request without the header, or with a
+  different value, is `now`. So an old node works as before.
+- `later`: nobody waits for it now, for example a phrase that the node
+  gets before it plays.
+
+The server keeps the requests in a queue:
+
+- A `now` request always goes before a `later` request. Requests with the
+  same priority keep their order of arrival.
+- The server makes a long text one sentence at a time. Between two
+  sentences of a `later` text, a `now` request can go first. So a `now`
+  request waits for one sentence at most.
+- When a `now` request asks for the same text, voice and speed as a
+  queued `later` request, the queued request becomes `now`. The server
+  makes the text one time, and both requests get the same answer.
+- When the `later` queue has `--later-limit` requests (32), the server
+  answers a new `later` request with `503` and `Retry-After` (seconds).
+  A node that sends `later` waits for that time, then tries again.
+  The server never refuses a `now` request for this reason.
+
+`/health` shows:
+
+- `queue`: the number of texts in the `now` and `later` queues. Two
+  requests for the same text count as one.
+- `wait_ms`: the time in the queue of the last `now` and the last `later`
+  request, in milliseconds, before the server started to make it.
+- `busy_503`: the number of `503` answers since start.
+- `workers`: the value of `--workers`.
+
+## Options
+
+- `--workers N` (1): the number of texts that the server makes at the
+  same time. With 2 or more, one worker makes only `now` requests, so a
+  `now` request does not wait for a `later` sentence. All workers use one
+  copy of the model, so more workers do not use much more memory. Each
+  worker uses the CPU cores, so use 2 or more only on a computer with
+  8 or more cores. Test the speed before and after.
+- `--later-limit N` (32): the most texts in the `later` queue. When the
+  queue is full, a new `later` request gets `503`. A `later` request for
+  a text that is in the queue already joins it and does not get `503`.
+
+`install.sh` does not set these options, so the server uses the
+defaults.
+
+## Tests
+
+The tests use a fake voice in place of Kokoro. They need Python 3 and
+numpy, not the model files:
+
+    python3 tools/voiceserver/test_server.py
 
 ## On the dashboard
 
