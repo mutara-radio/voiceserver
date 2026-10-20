@@ -2,6 +2,10 @@
 # with kokoro-v1.0.onnx and voices-v1.0.bin at /models. See README.md, or
 # use install.sh, which checks the host and the files first.
 #
+# The speech to text model is not in the image either. The server
+# downloads it from Hugging Face into /stt-models on its first start; keep
+# that folder in a volume. VOICESERVER_STT_MODEL=off turns it off.
+#
 # The base image is pinned by version and digest (python:3.12.14-slim-trixie,
 # 2026-09-25), and requirements.txt pins every package, so a build next
 # month makes the same image.
@@ -10,9 +14,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && pip check
 COPY server.py .
-RUN useradd --system --home /app mutara && mkdir /cache && chown mutara /cache
+RUN useradd --system --home /app mutara && mkdir /cache /stt-models && chown mutara /cache /stt-models
 USER mutara
-VOLUME ["/models", "/cache"]
+# huggingface_hub keeps its own files in HF_HOME; /app is not writable.
+ENV HF_HOME=/stt-models/hf HF_HUB_DISABLE_TELEMETRY=1
+VOLUME ["/models", "/cache", "/stt-models"]
 EXPOSE 7374
 # The check asks GET /health on the address that the server listens on.
 # The first start loads the model, which takes some seconds.
@@ -20,4 +26,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD ["python", "server.py", "--check"]
 # 0.0.0.0 inside the container; install.sh runs it with the host's network
 # and a --listen on localhost or a private address (see README.md).
-CMD ["python", "server.py", "--listen", "0.0.0.0:7374", "--models", "/models", "--cache", "/cache"]
+CMD ["python", "server.py", "--listen", "0.0.0.0:7374", "--models", "/models", "--cache", "/cache", "--stt-dir", "/stt-models"]
