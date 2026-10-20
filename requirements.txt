@@ -1,6 +1,7 @@
 # Every package is pinned, the dependencies too, so that each build is the
 # same. Each version was at least two weeks old when it was pinned
-# (2026-10-13). Change them together, and test a synthesis after.
+# (2026-10-20). Change them together, and test a synthesis and a
+# transcription after.
 kokoro-onnx==0.6.1
 numpy==2.5.3
 onnxruntime==1.30.0
@@ -14,3 +15,24 @@ typing_extensions==4.16.0
 flatbuffers==25.12.19
 packaging==26.3
 protobuf==7.36.2
+# Speech to text (POST /v1/transcribe). faster-whisper also uses
+# onnxruntime (for the VAD) and numpy above.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+# av 19 removed an argument that faster-whisper 1.2.1's decode_audio
+# uses (metadata_errors). Keep av below 19 until faster-whisper changes.
+av==18.1.0
+tokenizers==0.23.2
+huggingface-hub==1.33.0
+hf-xet==1.7.0
+filelock==4.0.12
+fsspec==2026.9.0
+pyyaml==6.0.3
+tqdm==4.70.1
+click==8.5.0
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.15.1
+idna==3.20
+certifi==2026.7.22
