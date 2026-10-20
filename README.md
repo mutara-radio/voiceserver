@@ -7,6 +7,11 @@ that is too large for a Raspberry Pi (about 350 MB of model files and up to
 (`af_sarah`); any American (`af_*`, `am_*`) or British (`bf_*`, `bm_*`)
 Kokoro voice works.
 
+It also writes the text of recorded clips (speech to text) with
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper), for the
+node's bundles and transcripts (ADR 0014 in the Mutara repo). See
+"Speech to text" below.
+
 This was the `tools/voiceserver` folder of Mutara until version 1.2.0.
 The history came with it. The HTTP contract with the node is in
 [API.md](API.md). The decision for the priority queue is ADR 0009 in
@@ -34,8 +39,12 @@ and a host below these minimums, and it has no option to skip them:
   we test them.
 - 4 or more cores and 4 GB or more memory. AVX2 is not needed: on an
   8-core virtual machine without AVX, 3 s of speech takes about 2 s.
-- Docker Engine, and about 1.5 GB of disk: the image (about 420 MB), the
-  model (about 350 MB) and the cache (up to `--cache-mb`, 500 MB).
+  Speech to text needs about 1 GB more memory, and up to 2 GB while it
+  makes the text of a long clip. On a 4 GB computer, use 6 GB or more,
+  or turn speech to text off.
+- Docker Engine, and about 2 GB of disk: the image (about 550 MB), the
+  speech model (about 350 MB), the speech to text model (about 470 MB)
+  and the cache (up to `--cache-mb`, 500 MB).
 
 ## Security
 
@@ -64,8 +73,9 @@ changes nothing:
 
 Then install: the same command without `--check`. The script builds the
 image here, starts the container `mutara-voiceserver` with
-`--restart unless-stopped`, host networking, the models read-only and the
-cache in the volume `mutara-voice-cache`. It waits for the server, makes a
+`--restart unless-stopped`, host networking, the models read-only, the
+cache in the volume `mutara-voice-cache` and the speech to text model in
+the volume `mutara-stt-models`. It waits for the server, makes a
 test sentence, and prints the address to set on the node. `--listen`
 defaults to `127.0.0.1:7374`, for a node on the same machine.
 
@@ -79,6 +89,8 @@ Needs Python 3.12 (espeak-ng from Homebrew on macOS):
 
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     .venv/bin/python server.py --models models --listen 127.0.0.1:7374
+
+The speech to text model goes into `stt-models` (`--stt-dir`).
 
 ## Set up the node
 
@@ -108,9 +120,14 @@ The full contract is in [API.md](API.md).
                       header X-Voice-Priority: now or later (optional)
                       -> audio/wav, 24 kHz mono 16-bit, speech at -20 dBFS RMS
                       -> 503 and Retry-After when the later queue is full
-    GET  /health      {"status": "ok", "version": "1.2.0", "model": ..., "voices": 28, "uptime_s": ...,
+    POST /v1/transcribe  multipart/form-data: file (Ogg Opus, at most 8 MB),
+                      language, prompt, id; the same priority header
+                      -> {"text": ..., "language": "en", "duration_ms": ...,
+                          "model": "small.en", "segments": [...]}
+    GET  /health      {"status": "ok", "version": "1.3.0", "model": ..., "voices": 28, "uptime_s": ...,
                        "workers": 1, "queue": {"now": 0, "later": 3},
-                       "wait_ms": {"now": 120, "later": 4100}, "busy_503": 0}
+                       "wait_ms": {"now": 120, "later": 4100}, "busy_503": 0,
+                       "transcribe": {"model": "small.en", "ready": true, "state": "ready"}}
     GET  /stats       counters: requests, errors, in flight, waiting, last error,
                       speech time (last, avg, p50, p95, max of the last 200),
                       cache hits, misses, entries and bytes, and the queue
@@ -123,6 +140,50 @@ A speech answer has `X-Cache: hit` or `miss`. The Docker health check runs
 Text is up to 400 characters. Made speech is kept in the cache folder, up
 to `--cache-mb` (500 MB), oldest out first. The cache keeps the full text
 as one answer.
+
+## Speech to text
+
+`POST /v1/transcribe` takes a recorded clip (Ogg Opus, as the node
+records it) and gives its text, in segments with times and a
+confidence. [API.md](API.md) has the full contract.
+
+- **Model.** faster-whisper on the CPU, `small.en` with `int8` by
+  default. The server loads it in the background after a start, so speech
+  works at once. The first start downloads it from Hugging Face (about
+  470 MB) into `--stt-dir`; the next starts use that copy. `/health`
+  shows `"transcribe": {"ready": true}` when it is loaded. If it can't
+  load, speech works on, `/health` shows `"state": "failed"` and the
+  error, and `/v1/transcribe` answers `501`.
+- **No internet on the server?** Copy a converted model folder (such as
+  the files of `Systran/faster-whisper-small.en`) to the server and set
+  `--stt-model` to that folder.
+- **Radio audio.** The server uses Whisper's VAD filter, so silence and
+  the noise of a squelch tail do not go to the model; a clip with only
+  noise or a carrier gives an empty text. The `prompt` (for example the
+  callsigns of the net) goes to the model as its first text, which helps
+  it to write callsigns as `W1AW`, not `W1 AW`.
+- **Speed.** On an Apple M4 Pro, `small.en` makes the text of a 5 s clip
+  in about 1 s, and of a 60 s clip in about 24 s. A small x86-64 server
+  is slower. `tiny.en` is 2 to 5 times faster, but makes more errors.
+- **The queue.** Transcriptions use the same queue as speech, with the
+  same `now` and `later` rules. The server makes a transcription one
+  segment at a time, and speech that waits goes first between two
+  segments. So an announcement waits for one segment at most.
+- **Privacy.** The server keeps no audio and no text. Its log has the
+  clip ID, the length and the number of segments, not the text.
+
+Settings (a command line option, or the environment variable):
+
+- `--stt-model` (`VOICESERVER_STT_MODEL`, `small.en`): a faster-whisper
+  model name, such as `tiny.en`, `base.en` or `small.en`, or a folder
+  with a converted model. `off` turns speech to text off.
+- `--stt-compute` (`VOICESERVER_STT_COMPUTE`, `int8`): the CTranslate2
+  compute type. `int8` is the fastest on most CPUs.
+- `--stt-dir` (`VOICESERVER_STT_DIR`, `stt-models`): the folder for the
+  downloaded model. In Docker it is `/stt-models`, a volume.
+
+To turn speech to text off in Docker, add
+`-e VOICESERVER_STT_MODEL=off` to `docker run`.
 
 ## Priority
 
@@ -174,10 +235,13 @@ defaults.
 
 ## Tests
 
-The tests use a fake voice in place of Kokoro. They need Python 3 and
-numpy, not the model files:
+The tests use a fake voice in place of Kokoro and a fake Whisper model.
+They need Python 3 and numpy, not the model files:
 
     python3 test_server.py
+
+With the packages of `requirements.txt` installed, one more test decodes
+a real Ogg Opus clip.
 
 ## On the dashboard
 
