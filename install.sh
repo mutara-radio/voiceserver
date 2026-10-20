@@ -9,8 +9,10 @@
 # again after a reboot. With --check it only does the checks and changes
 # nothing.
 #
-# The script does not download the model. Get the two files from the
-# kokoro-onnx project (see README.md) and put them in DIR.
+# The script does not download the speech model. Get the two files from
+# the kokoro-onnx project (see README.md) and put them in DIR. The server
+# downloads its speech to text model (about 470 MB) from Hugging Face on
+# its first start, into a Docker volume.
 #
 # The server has no password. It listens only on localhost or on a private
 # address, such as your Tailscale address. The script refuses any other
@@ -24,6 +26,7 @@ listen="127.0.0.1:7374"
 name="mutara-voiceserver"
 image="mutara-voiceserver"
 volume="mutara-voice-cache"
+stt_volume="mutara-stt-models"
 cache_mb=500
 check_only=0
 replace=0
@@ -56,6 +59,7 @@ Usage: $0 --models DIR [options]
   --name NAME         the container name (default $name)
   --image NAME        the image name (default $image)
   --cache-volume VOL  the Docker volume for the server's cache (default $volume)
+  --stt-volume VOL    the Docker volume for the speech to text model (default $stt_volume)
   --cache-mb N        the most MB of speech that the server keeps (default $cache_mb)
   --replace           replace a container with the same name (an upgrade)
   --check             do the checks only, and change nothing
@@ -73,6 +77,7 @@ while [ $# -gt 0 ]; do
     --name) name=${2:?}; shift 2 ;;
     --image) image=${2:?}; shift 2 ;;
     --cache-volume) volume=${2:?}; shift 2 ;;
+    --stt-volume) stt_volume=${2:?}; shift 2 ;;
     --cache-mb) cache_mb=${2:?}; shift 2 ;;
     --replace) replace=1; shift ;;
     --check) check_only=1; shift ;;
@@ -187,8 +192,9 @@ echo "Starting the container $name"
 # a host firewall such as ufw sees the port as an ordinary one (Docker's
 # published ports go around ufw's input rules).
 docker run -d --name "$name" --restart unless-stopped --network host \
-  -v "$models:/models:ro" -v "$volume:/cache" \
-  "$image" python server.py --listen "$listen" --models /models --cache /cache --cache-mb "$cache_mb" >/dev/null
+  -v "$models:/models:ro" -v "$volume:/cache" -v "$stt_volume:/stt-models" \
+  "$image" python server.py --listen "$listen" --models /models --cache /cache --cache-mb "$cache_mb" \
+  --stt-dir /stt-models >/dev/null
 
 echo "Waiting for the server to load the model"
 for _ in $(seq 60); do
@@ -213,6 +219,9 @@ print(f"  ok: {n / 48000:.1f} s of speech in {s:.1f} s{' (from the cache)' if ca
 if cache != "hit" and s > 10:
     print("  note: this computer is slow for the voice server. The node waits 5 s for most announcements and 30 s for weather alerts.")
 EOF
+
+echo "Speech to text: the server loads its model in the background (the first"
+echo "start downloads about 470 MB). GET /health shows \"transcribe\": {\"ready\": true} when it is ready."
 
 host=${listen%:*}
 echo
