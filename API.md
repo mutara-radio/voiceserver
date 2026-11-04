@@ -6,7 +6,7 @@ here that an old node or an old server cannot use is a new major
 version of this contract.
 
 - **Contract version:** 1
-- **Server version that this text agrees with:** 1.3.0
+- **Server version that this text agrees with:** 1.4.0
 
 ## POST /v1/speech
 
@@ -99,35 +99,38 @@ Answers that are not `200` have the body `{"error": "..."}`:
 - `413`: the file or the body is too large.
 - `501`: speech to text is off on this server (`--stt-model off`), or
   its model failed to load. `/health` says which.
-- `503` with `Retry-After` (seconds): the `later` queue is full, as for
-  `/v1/speech`. Only a `later` request gets this answer for this
+- `503` with `Retry-After` (seconds): the transcription queue is full
+  (see below). Only a `later` request gets this answer for this
   reason. A `later` request also gets `503` with `Retry-After: 30`
   while the model loads after a start; a `now` request waits for the
   model (at most 120 s).
 - `500`: the transcription failed.
 - `404`: an old server (before 1.3.0) has no such endpoint.
 
-Two requests for the same file, language and prompt at the same time
-become one job, as for speech. A `now` request promotes a queued `later`
-one. The server keeps no cache of transcripts.
+Two requests for the same file, language and prompt become one job. A
+`now` request promotes a queued `later` one. The result of a finished
+job is kept for an hour: a request for the same clip in that time gets
+it without a new transcription. A failed job is made again by the next
+request.
+
+The `prompt` goes to the model as hotwords, before every 30 s window of
+the clip (1.4.0; 1.3.0 used it for the first window only).
 
 ### The queue
 
-Speech and transcriptions share one queue and one CPU (ADR 0009):
+Since 1.4.0, transcriptions have a queue and one worker of their own
+(ADR 0001); speech never waits for them:
 
-- A `now` request goes before a `later` request, for both kinds.
-- The server makes a transcription one step at a time: the first step
-  decodes the audio and finds the speech, and each next step makes one
-  segment (up to 30 s of audio). Between two steps, waiting speech of
-  the same or a higher priority goes first. So a speech request waits
-  for one step at most. For `small.en` on a 4-core CPU, a step can take
-  some seconds.
-- Speech goes before a transcription of the same priority; between
-  transcriptions, the order of arrival is kept.
-- `--later-limit` counts speech and transcriptions together.
-- `queue`, `wait_ms` and `busy_503` in `/health` count both kinds.
-- With `--workers 2` or more, a transcription and speech can run at the
-  same time, as two texts can.
+- A `now` transcription goes before a `later` one; within a priority,
+  the order of arrival is kept.
+- The worker runs at a lower OS priority (on Linux) and on
+  `--stt-threads` cores.
+- The queue holds at most `--stt-queue-limit` jobs (64) and
+  `--stt-queue-mb` of audio (256). Over a limit, a new `later` request
+  gets `503`. A request for a clip that is queued already joins it.
+- `--later-limit`, and `queue`, `wait_ms` and `busy_503` at the top of
+  `/health`, are for speech only. The transcription queue has its own
+  fields in `transcribe`.
 
 ## GET /v1/voices
 
@@ -135,10 +138,12 @@ Speech and transcriptions share one queue and one CPU (ADR 0009):
 
 ## GET /health
 
-    {"status": "ok", "version": "1.3.0", "model": "kokoro-v1.0", "voices": 28,
+    {"status": "ok", "version": "1.4.0", "model": "kokoro-v1.0", "voices": 28,
      "uptime_s": 1234, "workers": 1, "queue": {"now": 0, "later": 3},
      "wait_ms": {"now": 120, "later": 4100}, "busy_503": 0,
-     "transcribe": {"model": "small.en", "ready": true, "state": "ready"}}
+     "transcribe": {"model": "small.en", "ready": true, "state": "ready",
+                    "queue": {"now": 0, "later": 2}, "processing": 1,
+                    "wait_ms": {"now": 900, "later": 61000}, "busy_503": 0}}
 
 The fields `workers`, `queue`, `wait_ms` and `busy_503` are new in 1.2.0.
 `transcribe` is new in 1.3.0. A node must accept a `/health` answer
@@ -153,6 +158,10 @@ without them.
   `off` (`--stt-model off`).
 - `model`: the model's name, or `null` when the state is `off`.
 - `error`: only when the state is `failed`; why it failed.
+- `queue`, `processing`, `wait_ms`, `busy_503` (new in 1.4.0): the jobs
+  waiting in the transcription queue, the job being made (0 or 1), the
+  time in the queue of the last `now` and `later` job before it
+  started, and the `503` answers since start.
 
 So a node finds speech to text this way:
 

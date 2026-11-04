@@ -351,11 +351,11 @@ class FakeWhisper:
 
     def __init__(self, synth, segments=SEGS):
         self.synth, self.segments = synth, segments
-        self.calls = []  # (language, initial_prompt, options) of each transcribe
+        self.calls = []  # (language, hotwords, options) of each transcribe
         self.gates = {}
 
-    def transcribe(self, audio, language=None, initial_prompt=None, **kw):
-        self.calls.append((language, initial_prompt, kw))
+    def transcribe(self, audio, language=None, hotwords=None, **kw):
+        self.calls.append((language, hotwords, kw))
 
         def gen():
             for s in self.segments:
@@ -398,7 +398,8 @@ class TranscribeTest(Base):
         super().setUp()
         self.whisper = FakeWhisper(self.synth)
         self.stt = self.make_stt()
-        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), server.handler(self.sp, lambda m: None, self.stt))
+        self.tr = server.Transcriber(self.stt, self.sp.stats, queue_limit=2)
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), server.handler(self.sp, lambda m: None, self.stt, self.tr))
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
 
@@ -451,6 +452,14 @@ class TranscribeTest(Base):
     def get(self, path):
         with urllib.request.urlopen(self.base + path, timeout=10) as r:
             return json.loads(r.read())
+
+    def stt_queued(self, now, later):
+        wait_until(lambda: self.tr.queue_info()["queue"] == {"now": now, "later": later})
+
+    def gate(self):
+        """Holds every transcription at its first segment until set."""
+        g = self.whisper.gates[SEGS[0].text] = threading.Event()
+        return g
 
     def test_answer(self):
         status, headers, out = self.post({"file": ogg(), "language": "EN", "prompt": "Net. Callsigns: W1AW, K1ABC.", "id": "clip-1"})
@@ -535,57 +544,112 @@ class TranscribeTest(Base):
         c.close()
 
     def test_busy_503_for_later_only(self):
-        self.synth.gate("A.")
-        self.speech_bg("A.", "later")
-        wait_until(self.synth.started.is_set)
+        g = self.gate()
+        first = self.post_bg({"file": ogg(b"0")}, "later")
+        wait_until(lambda: self.tr.queue_info()["processing"] == 1)
         self.post_bg({"file": ogg(b"1")}, "later")
-        self.queued(0, 2)
-        status, headers, out = self.post({"file": ogg(b"2")}, "later")
+        self.post_bg({"file": ogg(b"2")}, "later")
+        self.stt_queued(0, 2)
+        status, headers, out = self.post({"file": ogg(b"3")}, "later")
         self.assertEqual(status, 503)
         self.assertGreaterEqual(int(headers["Retry-After"]), 1)
         self.assertIn("error", out)
-        # A now request is never refused.
-        now = self.post_bg({"file": ogg(b"3")})
-        self.queued(1, 2)
-        self.synth.gates["A."].set()
+        # A now request to /v1/transcribe is never refused.
+        now = self.post_bg({"file": ogg(b"4")})
+        self.stt_queued(1, 2)
+        g.set()
         self.join()
-        self.assertEqual(self.results[now][0], 200)
-        self.assertEqual(self.get("/health")["busy_503"], 1)
+        self.assertEqual((self.results[first][0], self.results[now][0]), (200, 200))
+        self.assertEqual(self.get("/health")["transcribe"]["busy_503"], 1)
+        # Transcriptions do not fill the speech queue.
+        self.assertEqual(self.get("/health")["busy_503"], 0)
 
-    def test_speech_goes_between_segments(self):
-        self.whisper.gates[SEGS[0].text] = threading.Event()
-        stt = self.post_bg({"file": ogg()})
+    def test_speech_does_not_wait_for_transcription(self):
+        g = self.gate()
+        stt = self.post_bg({"file": ogg()}, "later")
         wait_until(lambda: "seg:" + SEGS[0].text.strip() in self.synth.calls)
-        later = self.speech_bg("L.", "later")
-        now = self.speech_bg("N.")
-        self.queued(2, 1)
-        self.whisper.gates[SEGS[0].text].set()
-        self.join()
-        # The now speech goes before the second segment of the now
-        # transcription; the later speech waits for all of it.
-        self.assertEqual(self.synth.calls, ["seg:W1AW, this is K1ABC,", "N.", "seg:checking in, no traffic.", "L."])
-        self.assertEqual(self.results[stt][0], 200)
+        now, later = self.speech_bg("N."), self.speech_bg("L.", "later")
+        for t in self.threads[1:]:
+            t.join(10)
         self.assertEqual((self.results[now], self.results[later]), (200, 200))
+        self.assertNotIn(stt, self.results)
+        g.set()
+        self.join()
+        self.assertEqual(self.results[stt][0], 200)
+
+    def test_now_goes_before_queued_later(self):
+        g = self.gate()
+        self.post_bg({"file": ogg(b"0")}, "later")
+        wait_until(lambda: self.tr.queue_info()["processing"] == 1)
+        self.post_bg({"file": ogg(b"LL")}, "later")
+        self.stt_queued(0, 1)
+        self.post_bg({"file": ogg(b"NNN")})
+        self.stt_queued(1, 1)
+        g.set()
+        self.join()
+        order = [j.size for j in sorted(self.tr.jobs.values(), key=lambda j: j.started)]
+        self.assertEqual(order, [len(ogg(b"0")), len(ogg(b"NNN")), len(ogg(b"LL"))])
+
+    def test_queue_bytes_limit(self):
+        self.tr.queue_bytes = len(ogg(b"1" * 10)) + len(ogg(b"2" * 10)) - 1
+        g = self.gate()
+        self.post_bg({"file": ogg(b"0")}, "later")
+        wait_until(lambda: self.tr.queue_info()["processing"] == 1)
+        self.post_bg({"file": ogg(b"1" * 10)}, "later")
+        self.stt_queued(0, 1)
+        self.assertEqual(self.post({"file": ogg(b"2" * 10)}, "later")[0], 503)
+        g.set()
+        self.join()
+
+    def test_hotwords_go_to_every_window(self):
+        self.assertEqual(self.post({"file": ogg(), "prompt": "KC Wide. Callsigns: KZ4JON."})[0], 200)
+        _, hotwords, kw = self.whisper.calls[0]
+        self.assertEqual(hotwords, "KC Wide. Callsigns: KZ4JON.")
+        self.assertNotIn("initial_prompt", kw)
 
     def test_same_clip_is_made_once(self):
-        self.whisper.gates[SEGS[0].text] = threading.Event()
+        g = self.gate()
+        self.post_bg({"file": ogg(b"0")}, "later")
+        wait_until(lambda: self.tr.queue_info()["processing"] == 1)
         a = self.post_bg({"file": ogg(), "id": "a"}, "later")
-        wait_until(self.synth.started.is_set)
+        self.stt_queued(0, 1)
         b = self.post_bg({"file": ogg(), "id": "b"})
-        self.queued(1, 0)  # b promoted a
-        self.whisper.gates[SEGS[0].text].set()
+        self.stt_queued(1, 0)  # b promoted a
+        g.set()
         self.join()
-        self.assertEqual(len(self.whisper.calls), 1)
+        self.assertEqual(len(self.whisper.calls), 2)
         self.assertEqual(self.results[a][2], self.results[b][2])
+        # The finished job answers the next request without the model.
+        self.assertEqual(self.post({"file": ogg()})[2], self.results[a][2])
+        self.assertEqual(len(self.whisper.calls), 2)
+
+    def test_finished_jobs_expire(self):
+        self.assertEqual(self.post({"file": ogg()})[0], 200)
+        self.tr.keep_s = 0
+        time.sleep(0.01)
+        self.assertEqual(self.post({"file": ogg(b"other")})[0], 200)
+        self.assertEqual(len(self.tr.jobs), 1)
 
     def test_health_and_stats(self):
         self.assertEqual(self.post({"file": ogg()})[0], 200)
         h = self.get("/health")
-        self.assertEqual(h["transcribe"], {"model": "small.en", "ready": True, "state": "ready"})
+        self.assertEqual(
+            h["transcribe"],
+            {
+                "model": "small.en",
+                "ready": True,
+                "state": "ready",
+                "queue": {"now": 0, "later": 0},
+                "processing": 0,
+                "wait_ms": {"now": h["transcribe"]["wait_ms"]["now"], "later": None},
+                "busy_503": 0,
+            },
+        )
         self.assertEqual(h["version"], server.VERSION)
         t = self.get("/stats")["transcribe"]
         self.assertEqual((t["requests"], t["ok"], t["errors"], t["in_flight"], t["ready"]), (1, 1, 0, 0, True))
         self.assertEqual(t["audio_s"], 6.2)
+        self.assertEqual((t["queue"], t["processing"], t["busy_503"]), ({"now": 0, "later": 0}, 0, 0))
         # Speech counters stay for speech only.
         self.assertEqual(self.get("/stats")["requests"], 0)
 
@@ -598,7 +662,10 @@ class TranscribeTest(Base):
         self.assertEqual((status, out), (500, {"error": "transcription failed"}))
         s = self.get("/stats")
         self.assertEqual((s["transcribe"]["errors"], s["errors"]), (1, 0))
-        self.assertEqual(self.sp.queue_info()["queue"], {"now": 0, "later": 0})
+        self.assertEqual(self.tr.queue_info()["queue"], {"now": 0, "later": 0})
+        # A failed job is made again by the next request.
+        del self.whisper.transcribe
+        self.assertEqual(self.post({"file": ogg()})[0], 200)
 
     def test_speech_still_works(self):
         status, headers, body = self.request("/v1/speech", json.dumps({"text": "Hello."}).encode(), "application/json")
@@ -617,7 +684,8 @@ class TranscribeOffTest(TranscribeTest):
         status, _, out = self.post({"file": ogg()})
         self.assertEqual(status, 501)
         self.assertIn("error", out)
-        self.assertEqual(self.get("/health")["transcribe"], {"model": None, "ready": False, "state": "off"})
+        t = self.get("/health")["transcribe"]
+        self.assertEqual((t["model"], t["ready"], t["state"]), (None, False, "off"))
 
     def test_failed_load(self):
         def fails(name):
@@ -633,8 +701,9 @@ class TranscribeOffTest(TranscribeTest):
     # The tests that need a model do not apply.
     test_no_language_and_no_prompt_are_none = test_empty_text = test_bad_requests = None
     test_too_large = test_chunked_body = test_busy_503_for_later_only = None
-    test_speech_goes_between_segments = test_same_clip_is_made_once = None
-    test_health_and_stats = test_model_error_is_500 = None
+    test_speech_does_not_wait_for_transcription = test_same_clip_is_made_once = None
+    test_health_and_stats = test_model_error_is_500 = test_now_goes_before_queued_later = None
+    test_queue_bytes_limit = test_hotwords_go_to_every_window = test_finished_jobs_expire = None
 
 
 class TranscribeLoadingTest(TranscribeTest):
@@ -656,8 +725,9 @@ class TranscribeLoadingTest(TranscribeTest):
 
     test_no_language_and_no_prompt_are_none = test_empty_text = test_bad_requests = None
     test_too_large = test_chunked_body = test_busy_503_for_later_only = None
-    test_speech_goes_between_segments = test_same_clip_is_made_once = None
-    test_health_and_stats = test_model_error_is_500 = None
+    test_speech_does_not_wait_for_transcription = test_same_clip_is_made_once = None
+    test_health_and_stats = test_model_error_is_500 = test_now_goes_before_queued_later = None
+    test_queue_bytes_limit = test_hotwords_go_to_every_window = test_finished_jobs_expire = None
 
 
 class FormTest(unittest.TestCase):
