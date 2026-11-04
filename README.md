@@ -124,10 +124,11 @@ The full contract is in [API.md](API.md).
                       language, prompt, id; the same priority header
                       -> {"text": ..., "language": "en", "duration_ms": ...,
                           "model": "small.en", "segments": [...]}
-    GET  /health      {"status": "ok", "version": "1.3.0", "model": ..., "voices": 28, "uptime_s": ...,
+    GET  /health      {"status": "ok", "version": "1.4.0", "model": ..., "voices": 28, "uptime_s": ...,
                        "workers": 1, "queue": {"now": 0, "later": 3},
                        "wait_ms": {"now": 120, "later": 4100}, "busy_503": 0,
-                       "transcribe": {"model": "small.en", "ready": true, "state": "ready"}}
+                       "transcribe": {"model": "small.en", "ready": true, "state": "ready",
+                                      "queue": {"now": 0, "later": 2}, "processing": 1, ...}}
     GET  /stats       counters: requests, errors, in flight, waiting, last error,
                       speech time (last, avg, p50, p95, max of the last 200),
                       cache hits, misses, entries and bytes, and the queue
@@ -148,7 +149,7 @@ records it) and gives its text, in segments with times and a
 confidence. [API.md](API.md) has the full contract.
 
 - **Model.** faster-whisper on the CPU, `small.en` with `int8` by
-  default. The server loads it in the background after a start, so speech
+  default; see "Choosing a model" below. The server loads it in the background after a start, so speech
   works at once. The first start downloads it from Hugging Face (about
   470 MB) into `--stt-dir`; the next starts use that copy. `/health`
   shows `"transcribe": {"ready": true}` when it is loaded. If it can't
@@ -160,16 +161,25 @@ confidence. [API.md](API.md) has the full contract.
 - **Radio audio.** The server uses Whisper's VAD filter, so silence and
   the noise of a squelch tail do not go to the model; a clip with only
   noise or a carrier gives an empty text. The `prompt` (for example the
-  callsigns of the net) goes to the model as its first text, which helps
-  it to write callsigns as `W1AW`, not `W1 AW`.
+  callsigns of the net) goes to the model as hotwords, before each 30 s
+  window of the clip, which helps it to write callsigns as `W1AW`, not
+  `W1 AW`, in a long clip too.
 - **Speed.** On an Apple M4 Pro, `small.en` makes the text of a 5 s clip
   in about 1 s, and of a 60 s clip in about 24 s. A small x86-64 server
   is slower. `tiny.en` is 2 to 5 times faster, but makes more errors.
-- **The queue.** Transcriptions use the same queue as speech, with the
-  same `now` and `later` rules. The server makes a transcription one
-  segment at a time, and speech that waits goes first between two
-  segments. So an announcement waits for one segment at most.
-- **Privacy.** The server keeps no audio and no text. Its log has the
+- **The queue.** Transcriptions have a queue and a worker of their own
+  (ADR 0001), so an announcement never waits for a transcription. A
+  `now` transcription (a user asked for one clip) goes before a `later`
+  one (a bundle), and a `now` request for a queued `later` clip promotes
+  it. The worker runs at a lower OS priority (nice 10, on Linux) and
+  uses `--stt-threads` cores, so speech keeps the rest. When the queue
+  has `--stt-queue-limit` jobs or `--stt-queue-mb` of audio, a new
+  `later` request gets `503` with `Retry-After`; a `now` request to
+  `/v1/transcribe` is never refused. A finished result is kept for an
+  hour, so a request for the same clip, language and prompt gets it at
+  once.
+- **Privacy.** The server keeps no audio on disk, and the text of a
+  finished clip in memory for an hour only. Its log has the
   clip ID, the length and the number of segments, not the text.
 
 Settings (a command line option, or the environment variable):
@@ -181,6 +191,30 @@ Settings (a command line option, or the environment variable):
   compute type. `int8` is the fastest on most CPUs.
 - `--stt-dir` (`VOICESERVER_STT_DIR`, `stt-models`): the folder for the
   downloaded model. In Docker it is `/stt-models`, a volume.
+- `--stt-threads` (`VOICESERVER_STT_THREADS`, 0): the CPU threads of the
+  model. 0 is half the cores that the server can use.
+- `--stt-queue-limit` (64) and `--stt-queue-mb` (256): the most jobs and
+  the most audio in the transcription queue.
+
+### Choosing a model
+
+A bigger model makes fewer errors and needs more memory and time. The
+numbers are rough, for `int8` on the CPU; measure on your own clips.
+
+| Model            | Download | Memory  | Time, against `small.en` |
+|------------------|----------|---------|--------------------------|
+| `tiny.en`        | 75 MB    | 0.3 GB  | 0.2 to 0.5x              |
+| `base.en`        | 145 MB   | 0.4 GB  | 0.4x                     |
+| `small.en`       | 470 MB   | 0.9 GB  | 1x (the default)         |
+| `distil-large-v3`| 1.5 GB   | 2 GB    | 1.5 to 2x                |
+| `medium.en`      | 1.5 GB   | 2 GB    | 2 to 3x                  |
+| `large-v3-turbo` | 1.6 GB   | 2 GB    | 2x                       |
+| `large-v3`       | 3 GB     | 3 to 4 GB | 5 to 6x                |
+
+Give the container the model's memory plus about 1 GB for speech and a
+long clip. When transcriptions are only for bundles, the time of a big
+model does not matter much: the job waits in the `later` queue, and
+speech does not wait for it.
 
 To turn speech to text off in Docker, add
 `-e VOICESERVER_STT_MODEL=off` to `docker run`.

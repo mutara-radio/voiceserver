@@ -18,11 +18,10 @@ Allison clips when the server does not answer in time. See README.md.
                          "transcribe": {"model": ..., "ready": ...}}
     GET  /stats         counters for the node's Health page; see Stats.json
 
-Requests wait in a queue (ADR 0009): now before later, in order of arrival
-within each, one sentence at a time, so a now request waits for at most
-one sentence of a later text. A transcription is in the same queue and
-goes one segment at a time; speech that waits goes before a transcription
-of the same priority.
+Speech requests wait in a queue (ADR 0009): now before later, in order of
+arrival within each, one sentence at a time, so a now request waits for at
+most one sentence of a later text. Transcriptions have a queue and a worker
+of their own (ADR 0001), so speech never waits for them.
 
 There is no authentication. Listen on localhost or a Tailscale address
 only, never on a public one.
@@ -55,7 +54,7 @@ DEFAULT_VOICE = "af_sarah"
 # MODEL names the model in cache keys, so new model files do not reuse old
 # audio.
 MODEL = "kokoro-v1.0"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 STT_MODEL = "small.en"  # the default faster-whisper model
 STT_RATE = 16000  # Whisper's sample rate
 MAX_AUDIO = 8 << 20  # bytes in the file part of /v1/transcribe
@@ -68,6 +67,12 @@ LISTEN_FILE = os.path.join(tempfile.gettempdir(), "mutara-voiceserver.listen")
 NOW, LATER = "now", "later"
 GAP = 0.25  # seconds of silence between sentences: kokoro-onnx's sentence_pause
 LATER_LIMIT = 32
+# The transcription queue (ADR 0001): jobs and bytes of audio in it before a
+# new one gets 503, and how long a finished job's result is kept.
+STT_QUEUE_LIMIT = 64
+STT_QUEUE_MB = 256
+STT_KEEP_S = 3600
+STT_NICE = 10
 
 
 def utc(t):
@@ -104,7 +109,7 @@ class Stats:
             setattr(self, counter, getattr(self, counter) + 1)
             self.last_error, self.last_error_at = msg, time.time()
 
-    def json(self, sp, stt):
+    def json(self, sp, stt, tr):
         with self.lock:
             t = sorted(self.times)
             last = self.times[-1] if self.times else None
@@ -142,6 +147,7 @@ class Stats:
                     "last_ms": self.stt_last_ms,
                 },
             }
+        out["transcribe"].update(tr.queue_info())
         out["cache"] = {"hits": self.hits, "misses": self.misses, **sp.cache.size()}
         q = sp.queue_info()
         out["waiting"] = q["waiting"]
@@ -361,24 +367,37 @@ def confidence(avg_logprob):
     return round(min(1.0, max(0.0, math.exp(avg_logprob))), 2)
 
 
+class NoModel(RuntimeError):
+    """Speech to text is off, or its model did not load."""
+
+
+QUEUED, PROCESSING, DONE, FAILED = "queued", "processing", "done", "failed"
+
+
 class Transcription:
-    """One clip to transcribe. All requests for its key wait on done.
+    """One clip to transcribe: a job of the Transcriber. All requests for
+    its key wait on done.
 
-    A worker makes it in steps, as a Job: the first step decodes the
-    audio, runs the VAD and starts the model; each next step decodes one
-    segment. So speech can go between two segments."""
+    The worker makes it in steps: the first step decodes the audio, runs
+    the VAD and starts the model; each next step decodes one segment. So
+    the job shows its progress, and a cancel stops it between two
+    segments."""
 
-    def __init__(self, key, stt, data, language, prompt, prio):
-        self.key, self.stt, self.prio = key, stt, prio
+    def __init__(self, key, data, language, prompt, prio):
+        self.key, self.prio = key, prio
         self.data, self.size = data, len(data)
         self.language, self.prompt = language, prompt
         self.segments = self.info = None
         self.out = []  # the finished segments
-        self.busy = False
-        self.started = None
+        self.state = QUEUED
+        self.cancelled = False
+        self.queued_at, self.started, self.finished_at = time.monotonic(), None, None
         self.work_ms = 0
         self.done = threading.Event()
-        self.result = self.error = None
+        self.result = None
+        # exc is the exception that the waiting requests raise; reason and
+        # error say why a failed job failed.
+        self.exc, self.reason, self.error = None, None, ""
 
     @staticmethod
     def key_of(model, data, language, prompt):
@@ -386,14 +405,18 @@ class Transcription:
         h.update(data)
         return h.hexdigest()
 
-    def step(self, sp):
+    def step(self, stt):
         """Starts the model, or makes one segment. Returns True when all
         are made."""
         if self.segments is None:
-            audio = self.stt.decode(self.data)
+            audio = stt.decode(self.data)
             self.data = None
-            self.segments, self.info = self.stt.model.transcribe(
-                audio, language=self.language or None, initial_prompt=self.prompt or None, **self.stt.options
+            # The prompt goes as hotwords: faster-whisper puts them before
+            # every 30 s window, where initial_prompt is used for the first
+            # window only (condition_on_previous_text is off). In the first
+            # window both do the same.
+            self.segments, self.info = stt.model.transcribe(
+                audio, language=self.language or None, hotwords=self.prompt or None, **stt.options
             )
             return False
         seg = next(self.segments, None)
@@ -402,13 +425,15 @@ class Transcription:
         self.out.append(seg)
         return False
 
-    def left_s(self, sp):
-        if self.info is None:
-            return self.size / OPUS_BPS * sp.stt_rtf
-        done = self.out[-1].end if self.out else 0.0
-        return max(0.0, self.info.duration - done) * sp.stt_rtf
+    def progress_ms(self):
+        return round(self.out[-1].end * 1000) if self.out else 0
 
-    def answer(self):
+    def left_s(self, rtf):
+        if self.info is None:
+            return self.size / OPUS_BPS * rtf
+        return max(0.0, self.info.duration - self.progress_ms() / 1000) * rtf
+
+    def answer(self, label):
         segs = []
         for s in self.out:
             text = s.text.strip()
@@ -425,9 +450,182 @@ class Transcription:
             "text": " ".join(s["text"] for s in segs),
             "language": self.info.language,
             "duration_ms": round(self.info.duration * 1000),
-            "model": self.stt.label,
+            "model": label,
             "segments": segs,
         }
+
+
+def lower_priority(n):
+    """Lowers the OS priority of the calling thread by n (nice), on Linux
+    only: there a thread has its own nice value, and the threads it starts
+    get it too. Elsewhere it would change the whole process."""
+    if n and sys.platform.startswith("linux"):
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), n)
+        except OSError:
+            pass
+
+
+def half_the_cores():
+    """Half the cores that the server can use: the CPU affinity, or a
+    cgroup v2 limit (Docker's cpus) when it is lower."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except AttributeError:  # macOS
+        n = os.cpu_count() or 2
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, int(quota) // int(period)))
+    except (OSError, ValueError):
+        pass
+    return max(1, n // 2)
+
+
+class Transcriber:
+    """Transcriptions in a queue of their own, with one worker (ADR 0001),
+    so speech never waits for them. A now job (one clip that a user asked
+    for) goes before a later one (a bundle); within a priority the order
+    of arrival is kept. A now request for a queued later job promotes it.
+
+    Jobs are kept by key, so the same clip, language and prompt make one
+    job. A finished job stays for keep_s seconds, so its result can be
+    picked up; a failed job is replaced by the next request for it.
+
+    The queue holds at most queue_limit jobs and queue_bytes of audio; a
+    new job over a limit raises Busy. stt is an STT; stats a Stats."""
+
+    def __init__(self, stt, stats, queue_limit=STT_QUEUE_LIMIT, queue_bytes=STT_QUEUE_MB << 20, keep_s=STT_KEEP_S, nice=0):
+        self.stt, self.stats = stt, stats
+        self.queue_limit, self.queue_bytes, self.keep_s = queue_limit, queue_bytes, keep_s
+        self.cv = threading.Condition()
+        self.queues = {NOW: collections.deque(), LATER: collections.deque()}
+        self.jobs = {}  # key -> Transcription, queued, processing or finished
+        self.current = None  # the job in processing
+        self.wait_ms = {NOW: None, LATER: None}
+        self.busy_503 = 0
+        self.rtf = 0.5  # transcription time / clip time, for Retry-After
+        threading.Thread(target=self.work, args=(nice,), daemon=True, name="stt").start()
+
+    def submit(self, data, language, prompt, prio=NOW, refuse_now=True):
+        """Returns the job for the clip: a new one, or the one that is
+        queued, processing or done already. Raises Busy when a new job
+        does not fit; with refuse_now False, only a later one."""
+        key = Transcription.key_of(self.stt.label, data, language, prompt)
+        with self.cv:
+            self.prune()
+            job = self.jobs.get(key)
+            if job is not None and job.state == FAILED:
+                job = None
+            if job is None:
+                queued = [j for q in self.queues.values() for j in q]
+                full = len(queued) >= self.queue_limit or sum(j.size for j in queued) + len(data) > self.queue_bytes
+                if full and (prio == LATER or refuse_now):
+                    self.busy_503 += 1
+                    raise Busy(self.retry_after())
+                job = Transcription(key, data, language, prompt, prio)
+                self.jobs[key] = job
+                self.queues[prio].append(job)
+                self.cv.notify_all()
+            elif prio == NOW and job.prio == LATER and job.state == QUEUED:
+                job.prio = NOW
+                self.queues[LATER].remove(job)
+                self.queues[NOW].append(job)
+            return job
+
+    def transcribe(self, data, language, prompt, prio=NOW):
+        """POST /v1/transcribe: makes the job and waits for it. Returns its
+        answer. Raises Busy for a later request when the queue is full,
+        and the job's exception when it fails."""
+        job = self.submit(data, language, prompt, prio, refuse_now=False)
+        job.done.wait()
+        if job.exc is not None:
+            raise job.exc
+        return job.result
+
+    def prune(self):
+        """Forgets finished jobs older than keep_s. Called with cv held."""
+        now = time.monotonic()
+        for key in [k for k, j in self.jobs.items() if j.finished_at is not None and now - j.finished_at > self.keep_s]:
+            del self.jobs[key]
+
+    def retry_after(self):
+        """Seconds until the queue has room, roughly: the time of the job
+        in processing and the first queued one. Called with cv held."""
+        s = sum(j.left_s(self.rtf) for j in [self.current, *(q[0] for q in self.queues.values() if q)] if j is not None)
+        return max(1, min(300, math.ceil(s)))
+
+    def work(self, nice):
+        lower_priority(nice)
+        while True:
+            with self.cv:
+                while not (self.queues[NOW] or self.queues[LATER]):
+                    self.cv.wait()
+                job = (self.queues[NOW] or self.queues[LATER]).popleft()
+                job.state, job.started = PROCESSING, time.monotonic()
+                self.wait_ms[job.prio] = round((job.started - job.queued_at) * 1000)
+                self.current = job
+            # A job sent while the model loads waits for it here.
+            self.stt.loaded.wait()
+            err = None
+            try:
+                if self.stt.state != "ready":
+                    raise NoModel("speech to text is not available")
+                while not job.cancelled:
+                    t0 = time.monotonic()
+                    done = job.step(self.stt)
+                    job.work_ms += round((time.monotonic() - t0) * 1000)
+                    if done:
+                        break
+            except Exception as e:  # noqa: BLE001 - given to the waiting requests
+                err = e
+            self.finish(job, err)
+
+    def finish(self, job, err):
+        """Counts the clip's audio and work time; the requests count ok
+        and failed answers, as each one gets its own."""
+        st = self.stats
+        if err is None and not job.cancelled:
+            try:
+                job.result = job.answer(self.stt.label)
+            except Exception as e:  # noqa: BLE001
+                err = e
+        if job.result is not None:
+            audio_ms = job.result["duration_ms"]
+            if audio_ms > 0:
+                self.rtf = 0.8 * self.rtf + 0.2 * job.work_ms / audio_ms
+            with st.lock:
+                st.stt_audio_ms += audio_ms
+                st.stt_work_ms += job.work_ms
+                st.stt_last_ms = job.work_ms
+            job.state = DONE
+        else:
+            job.state = FAILED
+            if job.cancelled:
+                job.reason, job.exc = "cancelled", RuntimeError("cancelled")
+            elif isinstance(err, BadAudio):
+                job.reason, job.exc = "bad_audio", err
+            elif isinstance(err, NoModel):
+                job.reason, job.exc = "model", err
+            else:
+                job.reason, job.exc = "error", err
+            job.error = str(job.exc)[:200]
+        job.data, job.segments = None, None
+        with self.cv:
+            job.finished_at = time.monotonic()
+            self.current = None
+            self.cv.notify_all()
+        job.done.set()
+
+    def queue_info(self):
+        with self.cv:
+            return {
+                "queue": {NOW: len(self.queues[NOW]), LATER: len(self.queues[LATER])},
+                "processing": 1 if self.current is not None else 0,
+                "wait_ms": dict(self.wait_ms),
+                "busy_503": self.busy_503,
+            }
 
 
 class STT:
@@ -480,15 +678,16 @@ class STT:
         return out
 
 
-def load_whisper(compute, root):
+def load_whisper(compute, root, threads=0):
     """Returns loader(name) for STT: a faster-whisper model on the CPU.
     name is a model name, such as small.en, or a folder with a converted
-    model. A name is downloaded from Hugging Face into root once."""
+    model. A name is downloaded from Hugging Face into root once. threads
+is CTranslate2's cpu_threads: 0 is its own default."""
 
     def loader(name):
         from faster_whisper import WhisperModel
 
-        return WhisperModel(name, device="cpu", compute_type=compute, download_root=root)
+        return WhisperModel(name, device="cpu", compute_type=compute, download_root=root, cpu_threads=threads)
 
     return loader
 
@@ -526,15 +725,13 @@ def load_kokoro(models):
 
 
 class Speaker:
-    """Makes speech and transcriptions in a priority queue (ADR 0009).
+    """Makes speech in a priority queue (ADR 0009).
 
     A now request always goes before a later one; within a priority the
-    order of arrival is kept, but speech goes before a transcription. A
-    worker makes one step of the first job in each turn: one sentence of a
-    text, or one segment of a transcription. So a now request waits for
-    one step at most. A job stays first in its queue until all its steps
-    are made. The full text is cached as one answer under the same key as
-    before; transcriptions are not cached.
+    order of arrival is kept. A worker makes one sentence of the first job
+    in each turn, so a now request waits for one sentence at most. A job
+    stays first in its queue until all its sentences are made. The full
+    text is cached as one answer under the same key as before.
 
     synth is synth(text, voice, speed, lang) -> (samples, rate); tests pass
     a fake one."""
@@ -549,7 +746,6 @@ class Speaker:
         self.wait_ms = {NOW: None, LATER: None}
         self.busy_503 = 0
         self.sentence_s = 1.0  # average time for one sentence, for Retry-After
-        self.stt_rtf = 0.5  # transcription time / clip time, for Retry-After
         for i in range(self.workers):
             # With 2 or more workers, worker 0 takes only now requests.
             now_only = self.workers >= 2 and i == 0
@@ -570,14 +766,6 @@ class Speaker:
         job, t0 = self.enqueue(key, lambda: Job(key, text, voice, speed, prio), prio)
         self.stats.add(misses=1)
         return self.wait(job, prio, t0), False
-
-    def transcribe(self, stt, data, language, prompt, prio=NOW):
-        """Returns the answer of POST /v1/transcribe as a dict. Raises Busy
-        as speech does, and BadAudio when the file can't be decoded. Two
-        requests for the same clip, language and prompt share one job."""
-        key = Transcription.key_of(stt.label, data, language, prompt)
-        job, t0 = self.enqueue(key, lambda: Transcription(key, stt, data, language, prompt, prio), prio)
-        return self.wait(job, prio, t0)
 
     def enqueue(self, key, make, prio):
         """Returns (job, t0): the job for key, new from make() or one that
@@ -621,11 +809,9 @@ class Speaker:
 
     def pick(self, now_only):
         for prio in (NOW,) if now_only else (NOW, LATER):
-            free = [job for job in self.queues[prio] if not job.busy]
-            if free:
-                # Speech is short and a listener can wait for it, so it
-                # goes before a transcription of the same priority.
-                return next((job for job in free if isinstance(job, Job)), free[0])
+            job = next((job for job in self.queues[prio] if not job.busy), None)
+            if job is not None:
+                return job
         return None
 
     def work(self, now_only):
@@ -656,25 +842,14 @@ class Speaker:
     def finish(self, job, err):
         if err is None:
             try:
-                if isinstance(job, Transcription):
-                    job.result = job.answer()
-                    audio_ms = job.result["duration_ms"]
-                    if audio_ms > 0:
-                        with self.cv:
-                            self.stt_rtf = 0.8 * self.stt_rtf + 0.2 * job.work_ms / audio_ms
-                    with self.stats.lock:
-                        self.stats.stt_audio_ms += audio_ms
-                        self.stats.stt_work_ms += job.work_ms
-                        self.stats.stt_last_ms = job.work_ms
-                else:
-                    gap = np.zeros(int(GAP * RATE))
-                    x = job.audio[0]
-                    for a in job.audio[1:]:
-                        x = np.concatenate([x, gap, a])
-                    job.result = to_wav(finish(x))
-                    self.cache.put(job.key, job.result)
-                    with self.stats.lock:
-                        self.stats.times.append(job.work_ms)
+                gap = np.zeros(int(GAP * RATE))
+                x = job.audio[0]
+                for a in job.audio[1:]:
+                    x = np.concatenate([x, gap, a])
+                job.result = to_wav(finish(x))
+                self.cache.put(job.key, job.result)
+                with self.stats.lock:
+                    self.stats.times.append(job.work_ms)
             except Exception as e:  # noqa: BLE001
                 err = e
         job.error = err
@@ -694,9 +869,15 @@ class Speaker:
             }
 
 
-def handler(sp, log, stt=None):
+def handler(sp, log, stt=None, tr=None):
+    """Returns the request handler class. sp is the Speaker; stt the STT
+    and tr its Transcriber, made here when not given."""
     st = sp.stats
     stt = stt or STT("")
+    tr = tr or Transcriber(stt, st)
+
+    def stt_info():
+        return {**stt.info(), **tr.queue_info()}
 
     class H(BaseHTTPRequestHandler):
         def send(self, code, body, ctype="application/json", headers=()):
@@ -730,11 +911,11 @@ def handler(sp, log, stt=None):
                         "queue": q["queue"],
                         "wait_ms": q["wait_ms"],
                         "busy_503": q["busy_503"],
-                        "transcribe": stt.info(),
+                        "transcribe": stt_info(),
                     },
                 )
             if self.path == "/stats":
-                return self.send(200, st.json(sp, stt))
+                return self.send(200, st.json(sp, stt, tr))
             if self.path == "/v1/voices":
                 return self.send(200, {"voices": sp.voices, "default": DEFAULT_VOICE})
             self.send(404, {"error": "not found"})
@@ -846,12 +1027,14 @@ def handler(sp, log, stt=None):
             if stt.state != "ready":
                 return self.send(501, {"error": "speech to text is not available"})
             try:
-                out = sp.transcribe(stt, data, language, prompt, prio)
+                out = tr.transcribe(data, language, prompt, prio)
             except Busy as e:
                 return self.send(503, {"error": "busy, try again later"}, headers=[("Retry-After", str(e.retry_after))])
             except BadAudio as e:
                 st.add(stt_bad=1)
                 return self.send(400, {"error": str(e)[:200]})
+            except NoModel:
+                return self.send(501, {"error": "speech to text is not available"})
             except Exception as e:  # noqa: BLE001 - report any model failure
                 log(f"transcribe failed: {e}")
                 st.failed(f"transcribe failed: {e}"[:200], "stt_errors")
@@ -900,6 +1083,14 @@ def main():
         help="faster-whisper model for /v1/transcribe: a name such as small.en, a folder, or off (env VOICESERVER_STT_MODEL)",
     )
     ap.add_argument("--stt-compute", default=env("VOICESERVER_STT_COMPUTE", "int8"), help="CTranslate2 compute type on the CPU (env VOICESERVER_STT_COMPUTE)")
+    ap.add_argument(
+        "--stt-threads",
+        type=int,
+        default=int(env("VOICESERVER_STT_THREADS", "0")),
+        help="CPU threads for speech to text; 0 is half the cores (env VOICESERVER_STT_THREADS)",
+    )
+    ap.add_argument("--stt-queue-limit", type=int, default=STT_QUEUE_LIMIT, help="transcriptions in the queue before a new one gets 503")
+    ap.add_argument("--stt-queue-mb", type=int, default=STT_QUEUE_MB, help="MB of audio in the transcription queue before a new one gets 503")
     ap.add_argument("--stt-dir", default=env("VOICESERVER_STT_DIR", "stt-models"), help="folder for downloaded speech to text models (env VOICESERVER_STT_DIR)")
     ap.add_argument("--check", action="store_true", help="check that the running server answers, and exit")
     args = ap.parse_args()
@@ -907,6 +1098,8 @@ def main():
         check()
     if args.workers < 1 or args.later_limit < 1:
         ap.error("--workers and --later-limit must be 1 or more")
+    if args.stt_threads < 0 or args.stt_queue_limit < 1 or args.stt_queue_mb < 1:
+        ap.error("--stt-threads must be 0 or more, --stt-queue-limit and --stt-queue-mb 1 or more")
 
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
@@ -915,15 +1108,24 @@ def main():
     cache = Cache(args.cache, args.cache_mb << 20)
     sp = Speaker(synth, voices, cache, Stats(), workers=args.workers, later_limit=args.later_limit)
     host, _, port = args.listen.rpartition(":")
-    stt = STT(args.stt_model, load_whisper(args.stt_compute, args.stt_dir))
-    srv = ThreadingHTTPServer((host.strip("[]") or "0.0.0.0", int(port)), handler(sp, log, stt))
+    threads = args.stt_threads or half_the_cores()
+    stt = STT(args.stt_model, load_whisper(args.stt_compute, args.stt_dir, threads))
+    tr = Transcriber(stt, sp.stats, args.stt_queue_limit, args.stt_queue_mb << 20, nice=STT_NICE)
+    srv = ThreadingHTTPServer((host.strip("[]") or "0.0.0.0", int(port)), handler(sp, log, stt, tr))
     with open(LISTEN_FILE, "w") as f:
         f.write(args.listen)
     log(f"voice server on {args.listen}, {len(sp.voices)} voices, default {DEFAULT_VOICE}, {sp.workers} workers, later limit {sp.later_limit}")
     if stt.name:
         # The server speaks while the model loads (and downloads, the first
         # time); /health says when it is ready.
-        threading.Thread(target=stt.load, args=(log,), daemon=True, name="stt-load").start()
+        # The model's threads are made here, so they get the lower priority
+        # of the thread that loads it.
+        def load():
+            lower_priority(STT_NICE)
+            stt.load(log)
+
+        log(f"speech to text: loading {stt.label}, {threads} threads")
+        threading.Thread(target=load, daemon=True, name="stt-load").start()
     else:
         log("speech to text is off")
     srv.serve_forever()
