@@ -115,24 +115,41 @@ POST   /v1/transcriptions        multipart/form-data, the same parts as
   -> 503 + Retry-After when the transcription queue is full
 
 GET    /v1/transcriptions/{id}   optional ?wait=N (seconds, at most 60)
-  -> 200 {"id": ..., "state": "queued" | "working" | "done" | "failed",
-          "position": 2,                       (queued)
-          "progress_ms": 31000,                (working: audio done)
-          "duration_ms": 63800,
+  -> 200 {"id": ..., "state": "queued" | "processing" | "done" | "failed",
+          "position": 2,                       (queued: jobs before it)
+          "progress_ms": 31000,                (processing: audio done)
+          "duration_ms": 63800,                (processing, done)
           "result": { the answer of POST /v1/transcribe },   (done)
-          "error": "..."}                      (failed)
-  -> 404 no such job (unknown, expired, or the server restarted)
+          "reason": "bad_audio" | "model" | "cancelled" | "error",
+          "error": "..."}                      (failed: code and text)
+  -> 404 {"state": "unknown", "error": "..."}: no such job (never
+     sent, expired, or the server restarted)
 
 DELETE /v1/transcriptions/{id}   cancel a queued job, or drop a result
   -> 204
 ```
 
+The states, as the node must read them:
+
+| State | Meaning | What the node does |
+|---|---|---|
+| `queued` | Not processed yet; `position` jobs go first. Not a timeout. | Ask again (with `?wait`). |
+| `processing` | The model works on it now. Not a timeout. | Ask again. |
+| `done` | `result` has the text (it can be empty: no speech). | Save it. |
+| `failed` | It will not work as sent. `reason` says why. | Show `error`; retry only for `error`. |
+| `unknown` (404) | The server does not have it (restart or expiry). | Send the clip again. |
+
+`?wait=N` that ends before the job is done answers `200` with
+`queued` or `processing`, never a timeout error. A server that does
+not answer at all is "down", as for speech; that is the node's own
+timeout, not a job state.
+
 - **The job ID** is the job's key: the SHA-256 of the model, the
   language, the prompt and the audio (`Transcription.key_of`). So the
-  same clip sent again gets the same job, queued, working or done, and
+  same clip sent again gets the same job, queued, processing or done, and
   a retry is always safe. It does not show the text or the audio.
 - **`?wait=N`** holds the answer up to N seconds, until the state
-  changes to `done` or `failed`. So the node asks seldom and still gets
+  is `done` or `failed`. So the node asks seldom and still gets
   the text at once.
 - **Polling, not a callback.** The server never calls the node: no new
   network path, no secret, no address to set. The node knows when it
@@ -146,9 +163,11 @@ DELETE /v1/transcriptions/{id}   cancel a queued job, or drop a result
   queued audio (`--stt-queue-limit`, `--stt-queue-mb`). A new job over
   a limit gets `503` with `Retry-After`. A job sent again joins its
   job and never gets `503`.
-- **`POST /v1/transcribe` stays**, with the same answer, for nodes that
-  do not know jobs. It makes a job in the new queue and waits for it.
-  Its `503` and `Retry-After` now come from the transcription queue.
+- **`POST /v1/transcribe` stays unchanged** for 0.9.x nodes: the same
+  request, the same answers and status codes. Inside, it makes a job in
+  the new queue and waits for it; its `503` and `Retry-After` now come
+  from the transcription queue. A 0.9.x node can still time out on a
+  slow model (its 5 minute `now` limit); that is not fixed for 0.9.x.
 - **Discovery.** `/health` gets `"transcribe": {"jobs": true, ...}`. A
   node that sees it uses the jobs; else it uses `POST /v1/transcribe`.
 
@@ -175,6 +194,29 @@ DELETE /v1/transcriptions/{id}   cancel a queued job, or drop a result
 
   The installer's memory check stays at 4 GB; the README says how much
   more a large model needs.
+
+### 4b. Tuned for radio, and measured
+
+Radio audio is band-limited, has squelch tails, carriers and changing
+levels. Each change below is kept only when it lowers the word error
+rate on our sample clips (card u116; reference text from the owner)
+without a new failure:
+
+- **The model** (decision 4): `small.en` against `medium.en`,
+  `large-v3-turbo`, `distil-large-v3` and `large-v3` on blue's 8 cores.
+- **The prompt:** "Amateur radio." with the callsigns and the module's
+  hint, as `initial_prompt` and `hotwords` (decision 4). Also a radio
+  vocabulary: net, check in, QSL, QRZ, 73, the phonetic alphabet.
+- **The VAD:** `threshold`, `min_silence_duration_ms` and
+  `speech_pad_ms` for radio speech; and off, to see what the VAD cuts.
+- **The audio before the model:** level normalization per clip, and a
+  band-pass of about 250 Hz to 3.4 kHz. Both are cheap NumPy work in
+  `decode`.
+
+A measuring script (`bench/`, outside the server) runs the clips
+through each setting and writes a table: word error rate, time, peak
+memory. The clips stay outside the repo; only the script and the table
+go in. The chosen settings become the defaults; each stays a setting.
 
 ### 5. The node
 
@@ -223,8 +265,9 @@ The node's side is Mutara work (`internal/voice/transcribe.go`,
 - The work, in this order:
   1. voiceserver: separate queue and worker, `--stt-threads`, `nice`,
      hotwords, the model table (1.4.0).
-  2. voiceserver: the job endpoints (1.4.0 or 1.5.0).
-  3. A benchmark of the models on our sample clips, to choose blue's
-     model and memory.
-  4. Mutara: the node uses the jobs.
+  2. voiceserver: the job endpoints (1.4.0), with the contract agreed
+     with the Mutara side first.
+  3. The measuring script and the tuning of decision 4b, to choose
+     blue's model, prompt, VAD and memory.
+  4. Mutara 0.10.0: the node uses the jobs.
   5. Deploy to blue, with the owner's OK.
