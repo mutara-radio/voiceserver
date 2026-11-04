@@ -13,6 +13,9 @@ Allison clips when the server does not answer in time. See README.md.
     POST /v1/transcribe multipart/form-data: file (Ogg Opus), language,
                         prompt, id; the same priority header
                         -> {"text": ..., "segments": [...], ...}
+    POST /v1/transcriptions   the same form -> 202 {"id": ..., "state": "queued"}
+    GET  /v1/transcriptions/{id}?wait=s  -> {"state": ..., "result": ...}
+    DELETE /v1/transcriptions/{id}       -> 204
     GET  /healthz       ok
     GET  /health        {"status": "ok", "version": ..., "uptime_s": ...,
                          "transcribe": {"model": ..., "ready": ...}}
@@ -39,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -73,6 +77,8 @@ STT_QUEUE_LIMIT = 64
 STT_QUEUE_MB = 256
 STT_KEEP_S = 3600
 STT_NICE = 10
+JOBS = "/v1/transcriptions"
+MAX_WAIT = 60  # seconds, for GET /v1/transcriptions/{id}?wait=
 
 
 def utc(t):
@@ -147,7 +153,7 @@ class Stats:
                     "last_ms": self.stt_last_ms,
                 },
             }
-        out["transcribe"].update(tr.queue_info())
+        out["transcribe"].update(tr.queue_info(), jobs=True)
         out["cache"] = {"hits": self.hits, "misses": self.misses, **sp.cache.size()}
         q = sp.queue_info()
         out["waiting"] = q["waiting"]
@@ -558,6 +564,8 @@ class Transcriber:
 
     def work(self, nice):
         lower_priority(nice)
+        # Jobs sent while the model loads stay queued until it is ready.
+        self.stt.loaded.wait()
         while True:
             with self.cv:
                 while not (self.queues[NOW] or self.queues[LATER]):
@@ -566,8 +574,6 @@ class Transcriber:
                 job.state, job.started = PROCESSING, time.monotonic()
                 self.wait_ms[job.prio] = round((job.started - job.queued_at) * 1000)
                 self.current = job
-            # A job sent while the model loads waits for it here.
-            self.stt.loaded.wait()
             err = None
             try:
                 if self.stt.state != "ready":
@@ -583,8 +589,9 @@ class Transcriber:
             self.finish(job, err)
 
     def finish(self, job, err):
-        """Counts the clip's audio and work time; the requests count ok
-        and failed answers, as each one gets its own."""
+        """Ends the job, and counts it: ok, bad_requests (a clip that can't
+        be decoded) or errors, and its audio and work time. Two requests
+        that share a job count as one."""
         st = self.stats
         if err is None and not job.cancelled:
             try:
@@ -596,6 +603,7 @@ class Transcriber:
             if audio_ms > 0:
                 self.rtf = 0.8 * self.rtf + 0.2 * job.work_ms / audio_ms
             with st.lock:
+                st.stt_ok += 1
                 st.stt_audio_ms += audio_ms
                 st.stt_work_ms += job.work_ms
                 st.stt_last_ms = job.work_ms
@@ -606,17 +614,71 @@ class Transcriber:
                 job.reason, job.exc = "cancelled", RuntimeError("cancelled")
             elif isinstance(err, BadAudio):
                 job.reason, job.exc = "bad_audio", err
+                st.add(stt_bad=1)
             elif isinstance(err, NoModel):
                 job.reason, job.exc = "model", err
             else:
                 job.reason, job.exc = "error", err
+                st.failed(f"transcribe failed: {err}"[:200], "stt_errors")
             job.error = str(job.exc)[:200]
         job.data, job.segments = None, None
         with self.cv:
             job.finished_at = time.monotonic()
-            self.current = None
+            if self.current is job:
+                self.current = None
             self.cv.notify_all()
         job.done.set()
+
+    def get(self, key):
+        """Returns the job with this ID, or None."""
+        with self.cv:
+            self.prune()
+            return self.jobs.get(key)
+
+    def status(self, job):
+        """The answer of GET /v1/transcriptions/{id}."""
+        out = {"id": job.key, "state": job.state}
+        with self.cv:
+            if job.state == QUEUED:
+                out["priority"] = job.prio
+                out["position"] = self.position(job)
+            elif job.state == PROCESSING:
+                out["priority"] = job.prio
+                out["progress_ms"] = job.progress_ms()
+                if job.info is not None:
+                    out["duration_ms"] = round(job.info.duration * 1000)
+        if job.state == DONE:
+            out["result"] = job.result
+        elif job.state == FAILED:
+            out["reason"], out["error"] = job.reason, job.error
+        return out
+
+    def position(self, job):
+        """The jobs before a queued job: the one in processing, the now
+        queue, and for a later job the later jobs before it. Called with cv
+        held."""
+        n = 1 if self.current is not None else 0
+        if job.prio == LATER:
+            n += len(self.queues[NOW])
+        q = self.queues[job.prio]
+        return n + (q.index(job) if job in q else 0)
+
+    def cancel(self, key):
+        """DELETE /v1/transcriptions/{id}: a queued job leaves the queue, a
+        job in processing stops after its segment, and a finished one is
+        forgotten. Returns False when there is no such job. Requests that
+        wait for the job get a failure with reason cancelled."""
+        with self.cv:
+            job = self.jobs.pop(key, None)
+            if job is None:
+                return False
+            job.cancelled = True
+            queued = job.state == QUEUED
+            if queued:
+                self.queues[job.prio].remove(job)
+        if queued:
+            self.finish(job, None)
+        return True
 
     def queue_info(self):
         with self.cv:
@@ -877,7 +939,7 @@ def handler(sp, log, stt=None, tr=None):
     tr = tr or Transcriber(stt, st)
 
     def stt_info():
-        return {**stt.info(), **tr.queue_info()}
+        return {**stt.info(), **tr.queue_info(), "jobs": True}
 
     class H(BaseHTTPRequestHandler):
         def send(self, code, body, ctype="application/json", headers=()):
@@ -918,13 +980,39 @@ def handler(sp, log, stt=None, tr=None):
                 return self.send(200, st.json(sp, stt, tr))
             if self.path == "/v1/voices":
                 return self.send(200, {"voices": sp.voices, "default": DEFAULT_VOICE})
+            if self.path.startswith(JOBS + "/"):
+                return self.job()
             self.send(404, {"error": "not found"})
 
+        def do_DELETE(self):
+            path = self.path.split("?")[0]
+            if not path.startswith(JOBS + "/"):
+                return self.send(404, {"error": "not found"})
+            if not tr.cancel(path[len(JOBS) + 1 :]):
+                return self.send(404, {"state": "unknown", "error": "no such transcription"})
+            self.send(204, b"")
+
+        def job(self):
+            path, _, query = self.path.partition("?")
+            job = tr.get(path[len(JOBS) + 1 :])
+            if job is None:
+                return self.send(404, {"state": "unknown", "error": "no such transcription"})
+            try:
+                wait = float(urllib.parse.parse_qs(query).get("wait", ["0"])[0])
+            except ValueError:
+                return self.send(400, {"error": "wait must be a number of seconds"})
+            if wait > 0:
+                job.done.wait(min(wait, MAX_WAIT))
+            self.send(200, tr.status(job))
+
         def do_POST(self):
-            if self.path == "/v1/transcribe":
+            if self.path in ("/v1/transcribe", "/v1/transcriptions"):
                 st.add(stt_requests=1, stt_in_flight=1)
                 try:
-                    self.transcribe()
+                    if self.path == "/v1/transcribe":
+                        self.transcribe()
+                    else:
+                        self.submit()
                 finally:
                     st.add(stt_in_flight=-1)
                 return
@@ -995,7 +1083,10 @@ def handler(sp, log, stt=None, tr=None):
                 raise ValueError("bad Content-Length")
             return self.rfile.read(n)
 
-        def transcribe(self):
+        def clip(self):
+            """Reads and checks a transcription request. Returns (data,
+            language, prompt, clip ID, priority), or None when it answered
+            the request with an error."""
             prio = LATER if self.headers.get("X-Voice-Priority", "").strip().lower() == LATER else NOW
             try:
                 f = form(self.headers.get("Content-Type", ""), self.body(MAX_FORM))
@@ -1019,6 +1110,31 @@ def handler(sp, log, stt=None, tr=None):
             except ValueError as e:
                 st.add(stt_bad=1)
                 return self.send(400, {"error": str(e)})
+            return data, language, prompt, clip, prio
+
+        def submit(self):
+            """POST /v1/transcriptions: queues the clip and answers at once
+            with its job ID (ADR 0001)."""
+            req = self.clip()
+            if req is None:
+                return
+            data, language, prompt, clip, prio = req
+            if stt.state in ("off", "failed"):
+                return self.send(501, {"error": "speech to text is not available"})
+            if stt.state == "loading" and prio == LATER:
+                return self.send(503, {"error": "the speech to text model is loading"}, headers=[("Retry-After", "30")])
+            try:
+                job = tr.submit(data, language, prompt, prio)
+            except Busy as e:
+                return self.send(503, {"error": "busy, try again later"}, headers=[("Retry-After", str(e.retry_after))])
+            log(f"queued {clip or '-'} ({prio}) as {job.key[:12]}")
+            self.send(202, tr.status(job), headers=[("Location", f"{JOBS}/{job.key}")])
+
+        def transcribe(self):
+            req = self.clip()
+            if req is None:
+                return
+            data, language, prompt, clip, prio = req
             if not stt.loaded.is_set():
                 # The model loads after start. A now request waits for it;
                 # a later one comes back.
@@ -1031,15 +1147,12 @@ def handler(sp, log, stt=None, tr=None):
             except Busy as e:
                 return self.send(503, {"error": "busy, try again later"}, headers=[("Retry-After", str(e.retry_after))])
             except BadAudio as e:
-                st.add(stt_bad=1)
                 return self.send(400, {"error": str(e)[:200]})
             except NoModel:
                 return self.send(501, {"error": "speech to text is not available"})
             except Exception as e:  # noqa: BLE001 - report any model failure
                 log(f"transcribe failed: {e}")
-                st.failed(f"transcribe failed: {e}"[:200], "stt_errors")
                 return self.send(500, {"error": "transcription failed"})
-            st.add(stt_ok=1)
             # The log has no text: it can be private.
             log(f"transcribed {clip or '-'} ({prio}): {out['duration_ms'] / 1000:.1f} s, {len(out['segments'])} segments")
             self.send(200, out)

@@ -630,6 +630,96 @@ class TranscribeTest(Base):
         self.assertEqual(self.post({"file": ogg(b"other")})[0], 200)
         self.assertEqual(len(self.tr.jobs), 1)
 
+    def call(self, method, path):
+        req = urllib.request.Request(self.base + path, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=70) as r:
+                body = r.read()
+                return r.status, json.loads(body) if body else None
+        except urllib.error.HTTPError as e:
+            with e:
+                body = e.read()
+                return e.code, json.loads(body) if body else None
+
+    def submit(self, fields, prio=None):
+        status, headers, body = self.request(server.JOBS, *multipart(fields), prio)
+        return status, headers, json.loads(body) if body else None
+
+    def test_job_flow(self):
+        status, headers, out = self.submit({"file": ogg(), "language": "en", "id": "clip-1"})
+        self.assertEqual(status, 202)
+        self.assertEqual(headers["Location"], f"{server.JOBS}/{out['id']}")
+        self.assertIn(out["state"], ("queued", "processing", "done"))
+        status, done = self.call("GET", f"{server.JOBS}/{out['id']}?wait=5")
+        self.assertEqual((status, done["state"]), (200, "done"))
+        # The result is the answer of POST /v1/transcribe for the same clip.
+        self.assertEqual(done["result"], self.post({"file": ogg(), "language": "en"})[2])
+        self.assertEqual(len(self.whisper.calls), 1)
+        t = self.get("/stats")["transcribe"]
+        self.assertEqual((t["requests"], t["ok"], t["jobs"]), (2, 1, True))
+
+    def test_job_states(self):
+        g = self.gate()
+        a = self.submit({"file": ogg(b"A")}, "later")[2]["id"]
+        wait_until(lambda: self.tr.queue_info()["processing"] == 1)
+        status, _, b = self.submit({"file": ogg(b"B")}, "later")
+        self.assertEqual((status, b["state"], b["position"], b["priority"]), (202, "queued", 1, "later"))
+        n = self.submit({"file": ogg(b"N")})[2]
+        self.assertEqual((n["position"], self.call("GET", f"{server.JOBS}/{b['id']}")[1]["position"]), (1, 2))
+        status, s = self.call("GET", f"{server.JOBS}/{a}")
+        self.assertEqual((status, s["state"], s["progress_ms"], s["duration_ms"]), (200, "processing", 0, 6240))
+        g.set()
+        self.assertEqual(self.call("GET", f"{server.JOBS}/{b['id']}?wait=5")[1]["state"], "done")
+
+    def test_job_cancel(self):
+        g = self.gate()
+        a = self.submit({"file": ogg(b"A")}, "later")[2]["id"]
+        wait_until(lambda: self.tr.queue_info()["processing"] == 1)
+        b = self.submit({"file": ogg(b"B")}, "later")[2]["id"]
+        self.assertEqual(self.call("DELETE", f"{server.JOBS}/{b}"), (204, None))
+        self.assertEqual(self.tr.queue_info()["queue"], {"now": 0, "later": 0})
+        self.assertEqual(self.call("GET", f"{server.JOBS}/{b}")[0], 404)
+        job = self.tr.get(a)
+        self.assertEqual(self.call("DELETE", f"{server.JOBS}/{a}")[0], 204)
+        g.set()
+        self.assertTrue(job.done.wait(5))
+        self.assertEqual((job.state, job.reason), ("failed", "cancelled"))
+        self.assertEqual(len(self.whisper.calls), 1)
+        wait_until(lambda: self.tr.queue_info()["processing"] == 0)
+        # A new request for a cancelled clip makes it again.
+        c = self.submit({"file": ogg(b"A")})[2]["id"]
+        self.assertEqual(self.call("GET", f"{server.JOBS}/{c}?wait=5")[1]["state"], "done")
+
+    def test_job_failed(self):
+        out = self.submit({"file": ogg(b"BAD")})[2]
+        status, s = self.call("GET", f"{server.JOBS}/{out['id']}?wait=5")
+        self.assertEqual((status, s["state"], s["reason"]), (200, "failed", "bad_audio"))
+        self.assertIn("decoded", s["error"])
+        self.assertEqual(self.get("/stats")["transcribe"]["bad_requests"], 1)
+        self.assertEqual(self.submit({"language": "en"})[0], 400)
+
+    def test_job_busy(self):
+        g = self.gate()
+        self.submit({"file": ogg(b"0")}, "later")
+        wait_until(lambda: self.tr.queue_info()["processing"] == 1)
+        self.submit({"file": ogg(b"1")}, "later")
+        self.submit({"file": ogg(b"2")}, "later")
+        status, headers, _ = self.submit({"file": ogg(b"3")}, "later")
+        self.assertEqual(status, 503)
+        self.assertGreaterEqual(int(headers["Retry-After"]), 1)
+        # A job is never waited for, so a full queue refuses now too.
+        self.assertEqual(self.submit({"file": ogg(b"4")})[0], 503)
+        # The same clip joins its job.
+        self.assertEqual(self.submit({"file": ogg(b"1")})[0], 202)
+        g.set()
+
+    def test_unknown_job(self):
+        for method in ("GET", "DELETE"):
+            status, out = self.call(method, f"{server.JOBS}/nothing")
+            self.assertEqual((status, out["state"]), (404, "unknown"))
+        self.assertEqual(self.call("GET", f"{server.JOBS}/x?wait=soon")[0], 404)
+        self.assertTrue(self.get("/health")["transcribe"]["jobs"])
+
     def test_health_and_stats(self):
         self.assertEqual(self.post({"file": ogg()})[0], 200)
         h = self.get("/health")
@@ -643,6 +733,7 @@ class TranscribeTest(Base):
                 "processing": 0,
                 "wait_ms": {"now": h["transcribe"]["wait_ms"]["now"], "later": None},
                 "busy_503": 0,
+                "jobs": True,
             },
         )
         self.assertEqual(h["version"], server.VERSION)
@@ -686,6 +777,7 @@ class TranscribeOffTest(TranscribeTest):
         self.assertIn("error", out)
         t = self.get("/health")["transcribe"]
         self.assertEqual((t["model"], t["ready"], t["state"]), (None, False, "off"))
+        self.assertEqual(self.submit({"file": ogg()})[0], 501)
 
     def test_failed_load(self):
         def fails(name):
@@ -704,6 +796,7 @@ class TranscribeOffTest(TranscribeTest):
     test_speech_does_not_wait_for_transcription = test_same_clip_is_made_once = None
     test_health_and_stats = test_model_error_is_500 = test_now_goes_before_queued_later = None
     test_queue_bytes_limit = test_hotwords_go_to_every_window = test_finished_jobs_expire = None
+    test_job_flow = test_job_states = test_job_cancel = test_job_failed = test_job_busy = test_unknown_job = None
 
 
 class TranscribeLoadingTest(TranscribeTest):
@@ -719,15 +812,22 @@ class TranscribeLoadingTest(TranscribeTest):
         now = self.post_bg({"file": ogg()})
         time.sleep(0.1)
         self.assertNotIn(now, self.results)
+        # A job: later comes back, now is queued until the model is ready.
+        status, headers, _ = self.submit({"file": ogg(b"job")}, "later")
+        self.assertEqual((status, headers["Retry-After"]), (503, "30"))
+        status, _, job = self.submit({"file": ogg(b"job")})
+        self.assertEqual((status, job["state"]), (202, "queued"))
         self.stt.load(lambda m: None)
         self.join()
         self.assertEqual(self.results[now][0], 200)
+        self.assertEqual(self.call("GET", f"{server.JOBS}/{job['id']}?wait=5")[1]["state"], "done")
 
     test_no_language_and_no_prompt_are_none = test_empty_text = test_bad_requests = None
     test_too_large = test_chunked_body = test_busy_503_for_later_only = None
     test_speech_does_not_wait_for_transcription = test_same_clip_is_made_once = None
     test_health_and_stats = test_model_error_is_500 = test_now_goes_before_queued_later = None
     test_queue_bytes_limit = test_hotwords_go_to_every_window = test_finished_jobs_expire = None
+    test_job_flow = test_job_states = test_job_cancel = test_job_failed = test_job_busy = test_unknown_job = None
 
 
 class FormTest(unittest.TestCase):
