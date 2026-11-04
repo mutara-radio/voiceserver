@@ -124,11 +124,14 @@ The full contract is in [API.md](API.md).
                       language, prompt, id; the same priority header
                       -> {"text": ..., "language": "en", "duration_ms": ...,
                           "model": "small.en", "segments": [...]}
+    POST /v1/transcriptions  the same form -> 202 {"id": ..., "state": "queued", ...}
+    GET  /v1/transcriptions/{id}?wait=30   -> {"state": "done", "result": {...}}
+    DELETE /v1/transcriptions/{id}         -> 204
     GET  /health      {"status": "ok", "version": "1.4.0", "model": ..., "voices": 28, "uptime_s": ...,
                        "workers": 1, "queue": {"now": 0, "later": 3},
                        "wait_ms": {"now": 120, "later": 4100}, "busy_503": 0,
                        "transcribe": {"model": "small.en", "ready": true, "state": "ready",
-                                      "queue": {"now": 0, "later": 2}, "processing": 1, ...}}
+                                      "jobs": true, "queue": {"now": 0, "later": 2}, ...}}
     GET  /stats       counters: requests, errors, in flight, waiting, last error,
                       speech time (last, avg, p50, p95, max of the last 200),
                       cache hits, misses, entries and bytes, and the queue

@@ -132,6 +132,61 @@ Since 1.4.0, transcriptions have a queue and one worker of their own
   `/health`, are for speech only. The transcription queue has its own
   fields in `transcribe`.
 
+## Transcription jobs
+
+New in 1.4.0 (ADR 0001). A job is for a clip that nobody waits for at
+once, such as a bundle's clips: the node drops it off, and picks the
+result up later. `/health` has `"transcribe": {"jobs": true}` on a
+server with jobs; on an old server `POST /v1/transcriptions` gets `404`,
+and the node uses `POST /v1/transcribe`.
+
+### POST /v1/transcriptions
+
+The same form and `X-Voice-Priority` header as `POST /v1/transcribe`.
+
+    202  {"id": "3f9a...", "state": "queued", "priority": "later", "position": 2}
+         header Location: /v1/transcriptions/3f9a...
+
+- The `id` is the same for the same file, language and prompt, so a
+  repeated request joins the job. When that job is done already, the
+  answer has `"state": "done"` and the result.
+- `400` and `413`: as for `/v1/transcribe`.
+- `501`: speech to text is off, or its model failed to load.
+- `503` with `Retry-After`: the queue is full; for a job a `now`
+  request gets this answer too. A `later` request also gets it with
+  `Retry-After: 30` while the model loads; a `now` job is queued, and
+  waits for the model.
+
+### GET /v1/transcriptions/{id}?wait=N
+
+Always `200` for a known job. `wait` (seconds, at most 60) holds the
+answer until the job finishes or the time is over; without it the
+answer comes at once.
+
+    {"id": ..., "state": "queued", "priority": "later", "position": 2}
+    {"id": ..., "state": "processing", "priority": "later",
+     "progress_ms": 31000, "duration_ms": 63800}
+    {"id": ..., "state": "done", "result": {"text": ..., "segments": [...], ...}}
+    {"id": ..., "state": "failed", "reason": "bad_audio", "error": "..."}
+
+- `position`: the jobs before this one, the one in processing too.
+- `progress_ms`: the end of the last finished segment. `duration_ms`
+  comes after the first step (the decode).
+- `result`: the same object as the answer of `POST /v1/transcribe`.
+- `reason`: `bad_audio` (the file can't be decoded), `model` (speech to
+  text is not available), `cancelled` or `error`.
+- A finished job is kept for an hour after it finishes. After that, or
+  for an ID the server does not know (it restarted, for example), the
+  answer is `404` with `{"state": "unknown", "error": ...}`: send the
+  clip again.
+
+### DELETE /v1/transcriptions/{id}
+
+`204`. A queued job leaves the queue; a job in processing stops after
+its current segment; a finished job is forgotten. `404` for an unknown
+ID. A request that waits on the same clip with `POST /v1/transcribe`
+gets `500`.
+
 ## GET /v1/voices
 
     {"voices": ["af_alloy", ...], "default": "af_sarah"}
@@ -158,6 +213,7 @@ without them.
   `off` (`--stt-model off`).
 - `model`: the model's name, or `null` when the state is `off`.
 - `error`: only when the state is `failed`; why it failed.
+- `jobs` (new in 1.4.0): `true` when the server has the job endpoints.
 - `queue`, `processing`, `wait_ms`, `busy_503` (new in 1.4.0): the jobs
   waiting in the transcription queue, the job being made (0 or 1), the
   time in the queue of the last `now` and `later` job before it
@@ -184,7 +240,10 @@ knows and ignores the others. The speech counters (`requests`, `ok`,
                    "last_ms": 23651}
 
 `audio_s` is the clip time and `work_s` the time to make the text, both
-since start. `last_ms` is the time of the last transcription.
+since start. `last_ms` is the time of the last transcription. Since 1.4.0,
+`ok`, `errors` and the decode failures in `bad_requests` count jobs, so
+two requests for one clip count once; `requests` counts the requests to
+both endpoints.
 
 ## GET /healthz
 
