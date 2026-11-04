@@ -676,7 +676,13 @@ class TranscribeTest(Base):
         a = self.submit({"file": ogg(b"A")}, "later")[2]["id"]
         wait_until(lambda: self.tr.queue_info()["processing"] == 1)
         b = self.submit({"file": ogg(b"B")}, "later")[2]["id"]
-        self.assertEqual(self.call("DELETE", f"{server.JOBS}/{b}"), (204, None))
+        import http.client
+
+        c = http.client.HTTPConnection("127.0.0.1", self.srv.server_address[1], timeout=10)
+        c.request("DELETE", f"{server.JOBS}/{b}")
+        r = c.getresponse()
+        self.assertEqual((r.status, r.getheader("Content-Length"), r.read()), (204, None, b""))
+        c.close()
         self.assertEqual(self.tr.queue_info()["queue"], {"now": 0, "later": 0})
         self.assertEqual(self.call("GET", f"{server.JOBS}/{b}")[0], 404)
         job = self.tr.get(a)
@@ -817,6 +823,9 @@ class TranscribeLoadingTest(TranscribeTest):
         self.assertEqual((status, headers["Retry-After"]), (503, "30"))
         status, _, job = self.submit({"file": ogg(b"job")})
         self.assertEqual((status, job["state"]), (202, "queued"))
+        # A later request for the same clip joins the queued job.
+        status, _, same = self.submit({"file": ogg(b"job")}, "later")
+        self.assertEqual((status, same["id"]), (202, job["id"]))
         self.stt.load(lambda m: None)
         self.join()
         self.assertEqual(self.results[now][0], 200)

@@ -110,23 +110,30 @@ New endpoints, in contract version 1 (only new routes and fields):
 POST   /v1/transcriptions        multipart/form-data, the same parts as
                                  POST /v1/transcribe; header
                                  X-Voice-Priority: now | later
-  -> 202 {"id": "<job id>", "state": "queued", "position": 3}
+  -> 202 {"id": "<job id>", "state": "queued", "priority": "later",
+          "position": 3}, header Location: /v1/transcriptions/<job id>
+          (a joined job answers with its state now: processing or done)
   -> 400, 413, 501 as POST /v1/transcribe
   -> 503 + Retry-After when the transcription queue is full
+  -> 503 + Retry-After: 30 for a new later job while the model loads;
+     a now job is queued and waits for the model
 
 GET    /v1/transcriptions/{id}   optional ?wait=N (seconds, at most 60)
   -> 200 {"id": ..., "state": "queued" | "processing" | "done" | "failed",
+          "priority": "now" | "later",         (queued, processing)
           "position": 2,                       (queued: jobs before it)
           "progress_ms": 31000,                (processing: audio done)
-          "duration_ms": 63800,                (processing, done)
+          "duration_ms": 63800,                (processing, after the decode)
           "result": { the answer of POST /v1/transcribe },   (done)
           "reason": "bad_audio" | "model" | "cancelled" | "error",
           "error": "..."}                      (failed: code and text)
   -> 404 {"state": "unknown", "error": "..."}: no such job (never
      sent, expired, or the server restarted)
 
-DELETE /v1/transcriptions/{id}   cancel a queued job, or drop a result
-  -> 204
+DELETE /v1/transcriptions/{id}   cancel a queued job, stop one in
+                                 processing, or drop a result
+  -> 204, and the job is forgotten: a later GET answers 404 unknown
+  -> 404 {"state": "unknown", ...} for an unknown ID
 ```
 
 The states, as the node must read them:
@@ -144,7 +151,7 @@ The reasons of `failed`:
 | `reason` | Meaning | What the node does |
 |---|---|---|
 | `bad_audio` | The clip can't be decoded. | Final: the clip failed. No retry. |
-| `cancelled` | A `DELETE` cancelled it. | Final. |
+| `cancelled` | A `DELETE` cancelled it. The `DELETE` also forgets the job, so only a request that waited on it (`POST /v1/transcribe`, or a `GET` with `?wait` in progress) sees this; a `GET` after the `DELETE` gets `404` unknown. | Final. |
 | `model` | No speech to text: the model is off, failed to load, or failed while the job waited. | As `ErrNoTranscribe`: check `/health` again; send again when `transcribe.ready` is true. |
 | `error` | The transcription failed for another reason. | Retry with backoff and a cap. |
 
@@ -174,8 +181,8 @@ timeout, not a job state.
   disk, as README.md promises.
 - **Limits:** at most 64 jobs in the queue, and at most 256 MB of
   queued audio (`--stt-queue-limit`, `--stt-queue-mb`). A new job over
-  a limit gets `503` with `Retry-After`. A job sent again joins its
-  job and never gets `503`.
+  a limit gets `503` with `Retry-After`, `now` too. A job sent again
+  joins its job and never gets `503`, also while the model loads.
 - **`POST /v1/transcribe` stays unchanged** for 0.9.x nodes: the same
   request, the same answers and status codes. Inside, it makes a job in
   the new queue and waits for it; its `503` and `Retry-After` now come
@@ -191,24 +198,29 @@ timeout, not a job state.
 
 ### 4. The hint for the whole clip, and the model as a setting
 
-- **Hotwords.** The prompt also goes to Whisper as `hotwords`, which it
-  uses in every 30 s window, not only the first. `initial_prompt`
-  stays for the first window. The prompt rules (1000 characters) do not
-  change. To check with card u116's clips: does the text after 30 s
+- **Hotwords.** The prompt goes to Whisper as `hotwords` only, which it
+  uses in every 30 s window, not only the first. `initial_prompt` is no
+  longer sent: with `condition_on_previous_text` off, it would only put
+  the same words before the first window, where the hotwords are
+  already. faster-whisper cuts the hotwords to 223 tokens. The prompt
+  rules (1000 characters) do not change. To check with card u116's clips: does the text after 30 s
   keep its callsigns, capitals and stops?
 - **The model stays a setting** (`--stt-model`, `--stt-compute`), with
   `small.en` the default. README.md gets a table of the models: memory,
   disk, speed on a 4-core and an 8-core x86-64 computer, and accuracy
   on our sample clips. Rough numbers before the test (int8, Whisper
-  only, one job at a time; Kokoro adds about 1 GB):
+  only, one job at a time; Kokoro adds about 1 GB). The same table is
+  in README.md:
 
-  | Model | Memory | Disk | Speed vs `small.en` |
+  | Model | Download | Memory | Time, against `small.en` |
   |---|---|---|---|
-  | `tiny.en`, `base.en` | under 0.5 GB | 75-150 MB | 2-5x faster |
-  | `small.en` (default) | about 1 GB | about 470 MB | 1x |
-  | `medium.en` | about 1.5 GB | about 800 MB | 2-3x slower |
-  | `large-v3-turbo`, `distil-large-v3` | 1.5-2 GB | about 800 MB | 3-5x slower |
-  | `large-v3` | 2.5-3.5 GB | about 1.6 GB | 8-10x slower |
+  | `tiny.en` | 75 MB | 0.3 GB | 0.2 to 0.5x |
+  | `base.en` | 145 MB | 0.4 GB | 0.4x |
+  | `small.en` (default) | 470 MB | 0.9 GB | 1x |
+  | `distil-large-v3` | 1.5 GB | 2 GB | 1.5 to 2x |
+  | `medium.en` | 1.5 GB | 2 GB | 2 to 3x |
+  | `large-v3-turbo` | 1.6 GB | 2 GB | 2x |
+  | `large-v3` | 3 GB | 3 to 4 GB | 5 to 6x |
 
   The installer's memory check stays at 4 GB; the README says how much
   more a large model needs.
@@ -223,7 +235,7 @@ without a new failure:
 - **The model** (decision 4): `small.en` against `medium.en`,
   `large-v3-turbo`, `distil-large-v3` and `large-v3` on blue's 8 cores.
 - **The prompt:** "Amateur radio." with the callsigns and the module's
-  hint, as `initial_prompt` and `hotwords` (decision 4). Also a radio
+  hint, as `hotwords` (decision 4). Also a radio
   vocabulary: net, check in, QSL, QRZ, 73, the phonetic alphabet.
 - **The VAD:** `threshold`, `min_silence_duration_ms` and
   `speech_pad_ms` for radio speech; and off, to see what the VAD cuts.
