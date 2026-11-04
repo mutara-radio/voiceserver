@@ -136,8 +136,21 @@ The states, as the node must read them:
 | `queued` | Not processed yet; `position` jobs go first. Not a timeout. | Ask again (with `?wait`). |
 | `processing` | The model works on it now. Not a timeout. | Ask again. |
 | `done` | `result` has the text (it can be empty: no speech). | Save it. |
-| `failed` | It will not work as sent. `reason` says why. | Show `error`; retry only for `error`. |
+| `failed` | It did not work. `reason` says why (below). | See `reason`. |
 | `unknown` (404) | The server does not have it (restart or expiry). | Send the clip again. |
+
+The reasons of `failed`:
+
+| `reason` | Meaning | What the node does |
+|---|---|---|
+| `bad_audio` | The clip can't be decoded. | Final: the clip failed. No retry. |
+| `cancelled` | A `DELETE` cancelled it. | Final. |
+| `model` | No speech to text: the model is off, failed to load, or failed while the job waited. | As `ErrNoTranscribe`: check `/health` again; send again when `transcribe.ready` is true. |
+| `error` | The transcription failed for another reason. | Retry with backoff and a cap. |
+
+A `POST` of a clip whose job is `failed` starts a new job with the same
+ID; a `POST` of a clip that is `queued`, `processing` or `done` joins
+that job.
 
 `?wait=N` that ends before the job is done answers `200` with
 `queued` or `processing`, never a timeout error. A server that does
@@ -168,8 +181,13 @@ timeout, not a job state.
   the new queue and waits for it; its `503` and `Retry-After` now come
   from the transcription queue. A 0.9.x node can still time out on a
   slow model (its 5 minute `now` limit); that is not fixed for 0.9.x.
-- **Discovery.** `/health` gets `"transcribe": {"jobs": true, ...}`. A
+- **Discovery.** `jobs: true` is a new field in the existing top-level
+  `transcribe` object of `/health` (and `/stats`), next to `model`,
+  `ready`, `state` and `error`, which keep their shape and meaning. A
   node that sees it uses the jobs; else it uses `POST /v1/transcribe`.
+- **A node restart.** The ID depends on the prompt, so the node keeps
+  the ID of each clip it sent and asks for it after a restart before it
+  posts the clip again.
 
 ### 4. The hint for the whole clip, and the model as a setting
 
