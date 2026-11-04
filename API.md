@@ -153,8 +153,9 @@ The same form and `X-Voice-Priority` header as `POST /v1/transcribe`.
 - `400` and `413`: as for `/v1/transcribe`.
 - `501`: speech to text is off, or its model failed to load.
 - `503` with `Retry-After`: the queue is full; for a job a `now`
-  request gets this answer too. A `later` request also gets it with
-  `Retry-After: 30` while the model loads; a `now` job is queued, and
+  request gets this answer too. A new `later` job also gets it with
+  `Retry-After: 30` while the model loads; a `later` request for a clip
+  that is queued already joins its job. A `now` job is queued, and
   waits for the model.
 
 ### GET /v1/transcriptions/{id}?wait=N
@@ -174,7 +175,8 @@ answer comes at once.
   comes after the first step (the decode).
 - `result`: the same object as the answer of `POST /v1/transcribe`.
 - `reason`: `bad_audio` (the file can't be decoded), `model` (speech to
-  text is not available), `cancelled` or `error`.
+  text is not available), `cancelled` (seen only by a `?wait` that was
+  in progress when the `DELETE` came) or `error`.
 - A finished job is kept for an hour after it finishes. After that, or
   for an ID the server does not know (it restarted, for example), the
   answer is `404` with `{"state": "unknown", "error": ...}`: send the
@@ -182,9 +184,11 @@ answer comes at once.
 
 ### DELETE /v1/transcriptions/{id}
 
-`204`. A queued job leaves the queue; a job in processing stops after
-its current segment; a finished job is forgotten. `404` for an unknown
-ID. A request that waits on the same clip with `POST /v1/transcribe`
+`204`, with no body. A queued job leaves the queue; a job in processing
+stops after its current segment; a finished job is forgotten. In each
+case the server forgets the job at once: a `GET` after the `DELETE`
+answers `404` with `"state": "unknown"`, not `failed` with `cancelled`.
+`404` for an unknown ID. A request that waits on the same clip with `POST /v1/transcribe`
 gets `500`.
 
 ## GET /v1/voices

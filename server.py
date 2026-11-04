@@ -514,16 +514,19 @@ class Transcriber:
         self.rtf = 0.5  # transcription time / clip time, for Retry-After
         threading.Thread(target=self.work, args=(nice,), daemon=True, name="stt").start()
 
-    def submit(self, data, language, prompt, prio=NOW, refuse_now=True):
+    def submit(self, data, language, prompt, prio=NOW, refuse_now=True, new=True):
         """Returns the job for the clip: a new one, or the one that is
         queued, processing or done already. Raises Busy when a new job
-        does not fit; with refuse_now False, only a later one."""
+        does not fit; with refuse_now False, only a later one. With new
+        False, returns None in place of a new job."""
         key = Transcription.key_of(self.stt.label, data, language, prompt)
         with self.cv:
             self.prune()
             job = self.jobs.get(key)
             if job is not None and job.state == FAILED:
                 job = None
+            if job is None and not new:
+                return None
             if job is None:
                 queued = [j for q in self.queues.values() for j in q]
                 full = len(queued) >= self.queue_limit or sum(j.size for j in queued) + len(data) > self.queue_bytes
@@ -607,9 +610,9 @@ class Transcriber:
                 st.stt_audio_ms += audio_ms
                 st.stt_work_ms += job.work_ms
                 st.stt_last_ms = job.work_ms
-            job.state = DONE
+            state = DONE
         else:
-            job.state = FAILED
+            state = FAILED
             if job.cancelled:
                 job.reason, job.exc = "cancelled", RuntimeError("cancelled")
             elif isinstance(err, BadAudio):
@@ -622,7 +625,10 @@ class Transcriber:
                 st.failed(f"transcribe failed: {err}"[:200], "stt_errors")
             job.error = str(job.exc)[:200]
         job.data, job.segments = None, None
+        # The state changes last, under cv, so status() never shows a
+        # finished job without its result or reason.
         with self.cv:
+            job.state = state
             job.finished_at = time.monotonic()
             if self.current is job:
                 self.current = None
@@ -637,20 +643,21 @@ class Transcriber:
 
     def status(self, job):
         """The answer of GET /v1/transcriptions/{id}."""
-        out = {"id": job.key, "state": job.state}
         with self.cv:
-            if job.state == QUEUED:
+            state = job.state
+            out = {"id": job.key, "state": state}
+            if state == QUEUED:
                 out["priority"] = job.prio
                 out["position"] = self.position(job)
-            elif job.state == PROCESSING:
+            elif state == PROCESSING:
                 out["priority"] = job.prio
                 out["progress_ms"] = job.progress_ms()
                 if job.info is not None:
                     out["duration_ms"] = round(job.info.duration * 1000)
-        if job.state == DONE:
-            out["result"] = job.result
-        elif job.state == FAILED:
-            out["reason"], out["error"] = job.reason, job.error
+            elif state == DONE:
+                out["result"] = job.result
+            else:
+                out["reason"], out["error"] = job.reason, job.error
         return out
 
     def position(self, job):
@@ -948,12 +955,14 @@ def handler(sp, log, stt=None, tr=None):
             elif isinstance(body, str):
                 body = body.encode()
             self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
+            if code != 204:  # a 204 has no body and no Content-Length
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
             for k, v in headers:
                 self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(body)
+            if code != 204:
+                self.wfile.write(body)
 
         def do_GET(self):
             if self.path == "/healthz":
@@ -1121,10 +1130,12 @@ def handler(sp, log, stt=None, tr=None):
             data, language, prompt, clip, prio = req
             if stt.state in ("off", "failed"):
                 return self.send(501, {"error": "speech to text is not available"})
-            if stt.state == "loading" and prio == LATER:
-                return self.send(503, {"error": "the speech to text model is loading"}, headers=[("Retry-After", "30")])
             try:
-                job = tr.submit(data, language, prompt, prio)
+                # While the model loads, a later request joins a job for the
+                # same clip, but makes no new one.
+                job = tr.submit(data, language, prompt, prio, new=not (stt.state == "loading" and prio == LATER))
+                if job is None:
+                    return self.send(503, {"error": "the speech to text model is loading"}, headers=[("Retry-After", "30")])
             except Busy as e:
                 return self.send(503, {"error": "busy, try again later"}, headers=[("Retry-After", str(e.retry_after))])
             log(f"queued {clip or '-'} ({prio}) as {job.key[:12]}")
@@ -1199,7 +1210,7 @@ def main():
     ap.add_argument(
         "--stt-threads",
         type=int,
-        default=int(env("VOICESERVER_STT_THREADS", "0")),
+        default=int(env("VOICESERVER_STT_THREADS") or "0"),
         help="CPU threads for speech to text; 0 is half the cores (env VOICESERVER_STT_THREADS)",
     )
     ap.add_argument("--stt-queue-limit", type=int, default=STT_QUEUE_LIMIT, help="transcriptions in the queue before a new one gets 503")
